@@ -1,10 +1,10 @@
 {
-  "timestamp": "2026-03-11T14:14:34.284567+00:00",
+  "timestamp": "2026-03-11T14:24:56.022644+00:00",
   "status": "warning",
   "metrics": {
     "cpu_percent": 0.5,
-    "ram_percent": 28.19,
-    "disk_percent": 2.24,
+    "ram_percent": 27.77,
+    "disk_percent": 2.25,
     "source": "fallback"
   },
   "log_check": {
@@ -14,39 +14,63 @@
     "stale_threshold_hours": 24.0
   },
   "thresholds": {
-    "disk_percent_warning": 85.0
+    "disk_percent_compress": 80.0,
+    "disk_percent_delete": 90.0
   },
-  "healer": {
+  "smart_retention": {
     "force_disk_high": true,
-    "disk_triggered": true,
-    "cleanup_days": 7,
-    "safe_clean_dirs": [
+    "compress_triggered": true,
+    "delete_triggered": false,
+    "safe_dirs": [
       "/root/openclaw-skills/proactive-agent",
       "/root/session-logs"
-    ]
+    ],
+    "history_log": "/root/openclaw-skills/proactive-agent/important_history.log"
+  },
+  "compression_stats": {
+    "enabled": true,
+    "threshold_percent": 80.0,
+    "delete_threshold_percent": 90.0,
+    "compress_days": 3,
+    "delete_gz_days": 14,
+    "bytes_before": 30300000,
+    "bytes_after": 102955,
+    "saved_kb": 29489.3,
+    "saved_ratio_percent": 99.66,
+    "compressed_count": 1
   },
   "actions_taken": [
     {
-      "timestamp": "2026-03-11T14:14:34.283568+00:00",
+      "timestamp": "2026-03-11T14:24:52.206307+00:00",
       "action": "gh_check",
       "success": true,
       "details": "gh version 2.45.0 (2025-07-18 Ubuntu 2.45.0-1ubuntu0.3)"
     },
     {
-      "timestamp": "2026-03-11T14:14:34.284548+00:00",
-      "action": "disk_log_cleanup",
+      "timestamp": "2026-03-11T14:24:55.015141+00:00",
+      "action": "log_compress",
       "success": true,
-      "details": "disk=2.24% (effective=85.01%) > 85.0%, removed=1, errors=0",
-      "cleanup": {
-        "removed_count": 1,
-        "removed_files": [
-          "/root/openclaw-skills/proactive-agent/tmp_old_cleanup_test.log"
+      "details": "disk=2.25% (effective=80.01%) > 80.0%, compressed=1, errors=0",
+      "compression": {
+        "compressed_count": 1,
+        "compressed_files": [
+          {
+            "source": "/root/openclaw-skills/proactive-agent/smart_retention_test2.log",
+            "target": "/root/openclaw-skills/proactive-agent/smart_retention_test2.log.gz",
+            "size_before": 30300000,
+            "size_after": 102955
+          }
         ],
-        "skipped_dirs": [
+        "skipped": [
           "/root/session-logs (not found)"
         ],
         "errors": [],
-        "days_threshold": 7
+        "days_threshold": 3,
+        "bytes_before": 30300000,
+        "bytes_after": 102955,
+        "saved_bytes": 30197045,
+        "saved_kb": 29489.3,
+        "saved_ratio_percent": 99.66
       },
       "forced": true
     }
@@ -54,5 +78,26 @@
   "warnings": [
     "Disk high simulation enabled (forced trigger)",
     "No logs found in /root/session-logs"
-  ]
+  ],
+  "compression_result": {
+    "compressed_count": 1,
+    "compressed_files": [
+      {
+        "source": "/root/openclaw-skills/proactive-agent/smart_retention_test2.log",
+        "target": "/root/openclaw-skills/proactive-agent/smart_retention_test2.log.gz",
+        "size_before": 30300000,
+        "size_after": 102955
+      }
+    ],
+    "skipped": [
+      "/root/session-logs (not found)"
+    ],
+    "errors": [],
+    "days_threshold": 3,
+    "bytes_before": 30300000,
+    "bytes_after": 102955,
+    "saved_bytes": 30197045,
+    "saved_kb": 29489.3,
+    "saved_ratio_percent": 99.66
+  }
 }
