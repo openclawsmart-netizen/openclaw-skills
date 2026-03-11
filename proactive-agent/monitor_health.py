@@ -5,6 +5,7 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -13,6 +14,8 @@ BASE_DIR = Path(__file__).resolve().parent
 REPORT_PATH = BASE_DIR / "health_report.json"
 LOG_DIR = Path("/root/session-logs")
 IMPORTANT_HISTORY_PATH = BASE_DIR / "important_history.log"
+OPENCLAW_ENV_PATH = Path(os.getenv("OPENCLAW_ENV_PATH", "/root/.openclaw_env"))
+TELEGRAM_SCRIPT_PATH = BASE_DIR / "send_telegram.py"
 DISK_COMPRESS_THRESHOLD = 80.0
 DISK_DELETE_THRESHOLD = 90.0
 LOG_STALE_HOURS = 24.0
@@ -313,6 +316,45 @@ def recover_gh_env_and_recheck() -> Tuple[bool, str]:
         return False, f"gh recovery failed: {e}"
 
 
+def load_kv_env_file(env_path: Path) -> Dict[str, str]:
+    values: Dict[str, str] = {}
+    if not env_path.exists() or not env_path.is_file():
+        return values
+
+    for raw in env_path.read_text(encoding="utf-8", errors="ignore").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, val = line.split("=", 1)
+        key = key.strip()
+        if not key:
+            continue
+        val = val.strip()
+        if (val.startswith('"') and val.endswith('"')) or (val.startswith("'") and val.endswith("'")):
+            val = val[1:-1]
+        values[key] = val
+
+    return values
+
+
+def summarize_actions(actions_taken: List[Dict]) -> str:
+    # 僅摘要真正的修復/清理行為，避免每次都被 gh_check 觸發
+    notable = [a for a in actions_taken if a.get("action") not in {"gh_check"}]
+    if not notable:
+        return ""
+
+    parts = []
+    for item in notable:
+        action = item.get("action", "unknown")
+        success = "ok" if item.get("success") else "fail"
+        details = str(item.get("details", "")).strip()
+        if len(details) > 140:
+            details = details[:137] + "..."
+        parts.append(f"- {action} [{success}] {details}")
+
+    return "\n".join(parts)
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description="Health monitor with smart-retention actions")
     parser.add_argument(
@@ -410,6 +452,49 @@ def main():
             warnings.append("gh command is unavailable after environment recovery")
 
     status = "warning" if warnings else "ok"
+
+    notification_result: Optional[Dict] = None
+    action_summary = summarize_actions(actions_taken)
+    if action_summary:
+        env_data = load_kv_env_file(OPENCLAW_ENV_PATH)
+        token_ok = bool(env_data.get("TELEGRAM_BOT_TOKEN", "").strip())
+        chat_ok = bool(env_data.get("TELEGRAM_CHAT_ID", "").strip())
+
+        if not token_ok or not chat_ok:
+            reason = "missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID"
+            notification_result = {
+                "attempted": False,
+                "skipped": True,
+                "reason": reason,
+                "env_path": str(OPENCLAW_ENV_PATH),
+            }
+            actions_taken.append(_action_record("telegram_notify", False, f"skipped: {reason}"))
+        elif not TELEGRAM_SCRIPT_PATH.exists():
+            reason = f"script not found: {TELEGRAM_SCRIPT_PATH}"
+            notification_result = {
+                "attempted": False,
+                "skipped": True,
+                "reason": reason,
+            }
+            actions_taken.append(_action_record("telegram_notify", False, f"skipped: {reason}"))
+        else:
+            message_text = (
+                f"[health] status={status}\n"
+                f"cpu={usage['cpu_percent']}% ram={usage['ram_percent']}% disk={usage['disk_percent']}%\n"
+                f"actions:\n{action_summary}"
+            )
+            cmd = [sys.executable, str(TELEGRAM_SCRIPT_PATH), "--message", message_text]
+            notify_proc = subprocess.run(cmd, capture_output=True, text=True)
+            ok = notify_proc.returncode == 0
+            details = (notify_proc.stdout or notify_proc.stderr or "").strip()[:200]
+            notification_result = {
+                "attempted": True,
+                "ok": ok,
+                "returncode": notify_proc.returncode,
+                "detail": details,
+            }
+            actions_taken.append(_action_record("telegram_notify", ok, details or f"returncode={notify_proc.returncode}"))
+
     compression_stats = {
         "enabled": True,
         "threshold_percent": DISK_COMPRESS_THRESHOLD,
@@ -447,6 +532,7 @@ def main():
         "compression_stats": compression_stats,
         "actions_taken": actions_taken,
         "warnings": warnings,
+        "notification": notification_result,
     }
 
     if compression_result is not None:

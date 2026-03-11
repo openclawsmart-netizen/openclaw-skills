@@ -22,6 +22,7 @@ python3 proactive-agent/monitor_health.py
 FILES=(
   "proactive-agent/health_report.json"
   "proactive-agent/monitor_health.py"
+  "proactive-agent/send_telegram.py"
   "proactive-agent/report_sync.sh"
 )
 
