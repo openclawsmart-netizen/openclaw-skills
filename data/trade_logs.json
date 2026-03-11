@@ -1,0 +1,19 @@
+[
+  {
+    "date": "2026-03-11 23:55:06",
+    "entry_price": 47259.0,
+    "take_profit_price": 47107.77,
+    "stop_loss_price": 47353.52,
+    "expected_profit_points": 151.2300000000032,
+    "analysis_reasoning": "Fallback engine based on EMA/RSI/MACD. history=No closed trade history yet.",
+    "error_review": "近期勝率偏低，已收斂風險並修正進場條件",
+    "optimization_suggestion": "依近期勝率動態調整進場過濾條件與停損帶寬。",
+    "prior_trade_status": {
+      "date": "2026-03-11T15:43:43.436013+00:00",
+      "entry_price": 47313.0,
+      "status": "OPEN",
+      "current_price": 47259.0,
+      "profit_loss_points": 54.0
+    }
+  }
+]

@@ -26,7 +26,10 @@ INTERVAL = "15m"
 PERIOD = "5d"
 
 BASE_DIR = Path(__file__).resolve().parents[1]
-DB_PATH = BASE_DIR / "data" / "trading_v1.db"
+DATA_DIR = BASE_DIR / "data"
+DB_PATH = DATA_DIR / "trading_v1.db"
+TRADE_LOG_JSON = DATA_DIR / "trade_logs.json"
+TRADE_LOG_CSV = DATA_DIR / "trade_logs.csv"
 TELEGRAM_SCRIPT = BASE_DIR / "proactive-agent" / "send_telegram.py"
 
 
@@ -463,23 +466,128 @@ def send_telegram(msg: str) -> str:
     return f"warn: telegram failed rc={proc.returncode} {err}"
 
 
+def trade_status_from_prices(side: str, entry: float, sl: float, tp: float, current_price: float) -> Tuple[str, float]:
+    side_u = str(side or "").upper()
+    if side_u == "LONG":
+        if current_price >= tp:
+            return "WIN", float(tp - entry)
+        if current_price <= sl:
+            return "LOSS", float(sl - entry)
+        return "OPEN", float(current_price - entry)
+    if side_u == "SHORT":
+        if current_price <= tp:
+            return "WIN", float(entry - tp)
+        if current_price >= sl:
+            return "LOSS", float(entry - sl)
+        return "OPEN", float(entry - current_price)
+    return "NA", 0.0
+
+
+def get_prior_trade_status(conn: sqlite3.Connection, current_price: float) -> Dict[str, Any]:
+    row = conn.execute(
+        """
+        SELECT opened_at, side, entry_price, sl, tp, status, close_price, pnl
+        FROM trades
+        ORDER BY datetime(opened_at) DESC, id DESC
+        LIMIT 1
+        """
+    ).fetchone()
+
+    if not row:
+        return {
+            "date": "NA",
+            "entry_price": 0.0,
+            "status": "NA",
+            "current_price": float(current_price),
+            "profit_loss_points": 0.0,
+        }
+
+    opened_at, side, entry_price, sl, tp, db_status, close_price, pnl = row
+    entry_v = safe_float(entry_price, 0.0)
+    sl_v = safe_float(sl, entry_v)
+    tp_v = safe_float(tp, entry_v)
+
+    db_status_s = str(db_status or "").upper()
+    if db_status_s in {"WIN", "LOSS"}:
+        current_v = safe_float(close_price, current_price)
+        pnl_v = safe_float(pnl, 0.0)
+        status = db_status_s
+    elif db_status_s == "OPEN":
+        current_v = float(current_price)
+        status, pnl_v = trade_status_from_prices(str(side), entry_v, sl_v, tp_v, current_v)
+    else:
+        current_v = float(current_price)
+        status, pnl_v = "NA", 0.0
+
+    return {
+        "date": str(opened_at or "NA"),
+        "entry_price": float(entry_v),
+        "status": status,
+        "current_price": float(current_v),
+        "profit_loss_points": float(pnl_v),
+    }
+
+
+def append_trade_log_and_export_csv(record: Dict[str, Any]) -> Tuple[int, str, str]:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+    records: List[Dict[str, Any]] = []
+    if TRADE_LOG_JSON.exists():
+        try:
+            with TRADE_LOG_JSON.open("r", encoding="utf-8") as f:
+                loaded = json.load(f)
+            if isinstance(loaded, list):
+                records = loaded
+        except Exception:
+            records = []
+
+    records.append(record)
+
+    with TRADE_LOG_JSON.open("w", encoding="utf-8") as f:
+        json.dump(records, f, ensure_ascii=False, indent=2)
+
+    try:
+        import pandas as pd  # type: ignore
+
+        pd.read_json(str(TRADE_LOG_JSON)).to_csv(TRADE_LOG_CSV, index=False, encoding="utf-8-sig")
+    except Exception as exc:
+        eprint(f"[warn] CSV export failed: {exc}")
+
+    return len(records), str(TRADE_LOG_JSON), str(TRADE_LOG_CSV)
+
+
 def main() -> int:
     yf = ensure_deps()
     s = fetch_snapshot(yf)
 
-    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(DB_PATH)
     try:
         ensure_db(conn)
         closed = settle_open_trades(conn, s.close)
         winrate, _, history_summary = get_reflection(conn)
         plan = llm_plan(s, winrate, history_summary) or rule_plan(s, winrate, history_summary)
+        prior_trade_status = get_prior_trade_status(conn, s.close)
         opened = maybe_open_trade(conn, plan)
     finally:
         conn.close()
 
     trend = trend_summary(s)
     tg_state = send_telegram(telegram_summary(winrate, plan.reflection_one_liner, trend, plan))
+
+    expected_profit_points = plan.tp - plan.entry if plan.action != "SHORT" else plan.entry - plan.tp
+    log_record: Dict[str, Any] = {
+        "date": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "entry_price": float(plan.entry),
+        "take_profit_price": float(plan.tp),
+        "stop_loss_price": float(plan.sl),
+        "expected_profit_points": float(expected_profit_points),
+        "analysis_reasoning": str(plan.reason),
+        "error_review": str(plan.reflection_one_liner),
+        "optimization_suggestion": "依近期勝率動態調整進場過濾條件與停損帶寬。",
+        "prior_trade_status": prior_trade_status,
+    }
+    log_count, json_path, csv_path = append_trade_log_and_export_csv(log_record)
 
     print(f"[info] Symbol={SYMBOL} interval={INTERVAL} ts={s.ts}")
     print(f"[info] Indicators: Close={s.close:.2f} EMA20={s.ema20:.2f} EMA50={s.ema50:.2f} RSI14={s.rsi14:.2f} MACD={s.macd:.3f}/{s.macd_signal:.3f}")
@@ -489,6 +597,7 @@ def main() -> int:
         f"entry={plan.entry:.2f} sl={plan.sl:.2f} tp={plan.tp:.2f}"
     )
     print(f"[info] Trades: settled_open={closed}, opened_new={opened}")
+    print(f"[info] Log export: records={log_count} json={json_path} csv={csv_path}")
     print(f"[info] Telegram: {tg_state}")
     return 0
 
