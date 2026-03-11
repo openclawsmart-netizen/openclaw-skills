@@ -1,0 +1,18 @@
+title: OpenClaw 新手必备！安装实用Skills，模型选择，浏览器自动化等！ – 零度博客
+summary_500: OpenClaw 新手必备！安装实用Skills，模型选择，浏览器自动化等！
+2026年3月9日
+admin
+AI
+Youtube视频
+相信大家已经使用OpenClaw一段时间了，是不是有时候会觉得自己的 OpenClaw（龙虾）不好用、不够智能，甚至连浏览器自动化都实现不了？其实问题往往不在工具本身，而是在模型没有选对，或者关键的 skills 没有安装完整。今天这篇文章，我会一次性帮你彻底解决这些核心痛点，避免走弯路，更别再被人割韭菜。
+Openclaw 最佳模型选择
+【
+点击前往
+】查看最佳模型
+安装 OpenClaw 最新版本：
+在Power shell下以管理员身份运行下方命令：
+iwr -useb https://openclaw.ai/install.ps1 | iex
+如果出现闪退现象，先执行下方的命令即可解决：
+Set-ExecutionPolicy RemoteSigned -Scope CurrentUser
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+如果你之前已经安装过OpenClaw，
