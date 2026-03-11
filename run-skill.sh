@@ -15,6 +15,7 @@ Examples:
   ./run-skill.sh web-fetch https://github.com/trending
   ./run-skill.sh daily-brief
   ./run-skill.sh daily-brief --url https://news.ycombinator.com --top 3
+  ./run-skill.sh system-status
 EOF
 }
 

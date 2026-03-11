@@ -14,5 +14,9 @@
   "daily-brief": {
     "description": "Fetch tech headlines and send daily brief to Telegram (graceful skip if env missing)",
     "command": "python3 scripts/daily_brief.py"
+  },
+  "system-status": {
+    "description": "Collect system status (temp/memory/load/disk) and send to Telegram (graceful skip if env missing)",
+    "command": "python3 scripts/system_status.py"
   }
 }
