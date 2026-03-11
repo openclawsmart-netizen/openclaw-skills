@@ -1,10 +1,10 @@
 {
-  "timestamp": "2026-03-11T14:29:29.989022+00:00",
+  "timestamp": "2026-03-11T16:00:09.314959+00:00",
   "status": "warning",
   "metrics": {
-    "cpu_percent": 1.01,
-    "ram_percent": 26.75,
-    "disk_percent": 2.24,
+    "cpu_percent": 56.62,
+    "ram_percent": 27.8,
+    "disk_percent": 2.4,
     "source": "fallback"
   },
   "log_check": {
@@ -18,8 +18,8 @@
     "disk_percent_delete": 90.0
   },
   "smart_retention": {
-    "force_disk_high": true,
-    "compress_triggered": true,
+    "force_disk_high": false,
+    "compress_triggered": false,
     "delete_triggered": false,
     "safe_dirs": [
       "/root/openclaw-skills/proactive-agent",
@@ -41,61 +41,14 @@
   },
   "actions_taken": [
     {
-      "timestamp": "2026-03-11T14:29:28.986144+00:00",
+      "timestamp": "2026-03-11T16:00:09.314907+00:00",
       "action": "gh_check",
       "success": true,
       "details": "gh version 2.45.0 (2025-07-18 Ubuntu 2.45.0-1ubuntu0.3)"
-    },
-    {
-      "timestamp": "2026-03-11T14:29:28.986713+00:00",
-      "action": "log_compress",
-      "success": true,
-      "details": "disk=2.24% (effective=80.01%) > 80.0%, compressed=0, errors=0",
-      "compression": {
-        "compressed_count": 0,
-        "compressed_files": [],
-        "skipped": [
-          "/root/session-logs (not found)"
-        ],
-        "errors": [],
-        "days_threshold": 3,
-        "bytes_before": 0,
-        "bytes_after": 0,
-        "saved_bytes": 0,
-        "saved_kb": 0.0,
-        "saved_ratio_percent": 0.0
-      },
-      "forced": true
-    },
-    {
-      "timestamp": "2026-03-11T14:29:29.988969+00:00",
-      "action": "telegram_notify",
-      "success": false,
-      "details": "skipped: missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID"
     }
   ],
   "warnings": [
-    "Disk high simulation enabled (forced trigger)",
     "No logs found in /root/session-logs"
   ],
-  "notification": {
-    "attempted": false,
-    "skipped": true,
-    "reason": "missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID",
-    "env_path": "/tmp/nonexistent_openclaw_env"
-  },
-  "compression_result": {
-    "compressed_count": 0,
-    "compressed_files": [],
-    "skipped": [
-      "/root/session-logs (not found)"
-    ],
-    "errors": [],
-    "days_threshold": 3,
-    "bytes_before": 0,
-    "bytes_after": 0,
-    "saved_bytes": 0,
-    "saved_kb": 0.0,
-    "saved_ratio_percent": 0.0
-  }
+  "notification": null
 }
