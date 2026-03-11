@@ -1,0 +1,30 @@
+[dry-run] generated_at=2026-03-11T22:35:49.488251+08:00
+source_file=/root/openclaw-skills/agent-browser/fetched_info.log
+source_exists=True
+
+[tutorial_classification]
+is_tutorial=True
+keyword_hits_count=4
+keyword_hits=新手, 安装, 使用, install
+
+[extraction_summary]
+shell_commands_count=2
+python_blocks_count=0
+
+[shell_commands]
+- [LOW] Set-ExecutionPolicy RemoteSigned -Scope CurrentUser
+- [LOW] Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+
+[python_blocks_preview]
+- (none)
+
+[planned_behavior_if_enabled_in_future]
+- Could run reviewed installer steps in a guarded allowlist mode.
+- Could require explicit user confirmation before each command.
+- Could block HIGH-risk commands unless an override is provided.
+
+[current_behavior]
+- Analysis only.
+- Writes generated_from_fetched.py (commented snippets only).
+- Writes this dry_run_report.log.
+- Executes nothing from extracted content.
