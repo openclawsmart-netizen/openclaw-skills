@@ -1,9 +1,9 @@
 {
-  "timestamp": "2026-03-11T16:00:09.314959+00:00",
+  "timestamp": "2026-03-11T22:00:10.568911+00:00",
   "status": "warning",
   "metrics": {
-    "cpu_percent": 56.62,
-    "ram_percent": 27.8,
+    "cpu_percent": 23.56,
+    "ram_percent": 28.18,
     "disk_percent": 2.4,
     "source": "fallback"
   },
@@ -41,7 +41,7 @@
   },
   "actions_taken": [
     {
-      "timestamp": "2026-03-11T16:00:09.314907+00:00",
+      "timestamp": "2026-03-11T22:00:10.568851+00:00",
       "action": "gh_check",
       "success": true,
       "details": "gh version 2.45.0 (2025-07-18 Ubuntu 2.45.0-1ubuntu0.3)"
