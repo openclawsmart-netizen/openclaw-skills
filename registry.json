@@ -18,5 +18,9 @@
   "system-status": {
     "description": "Collect system status (temp/memory/load/disk) and send to Telegram (graceful skip if env missing)",
     "command": "python3 scripts/system_status.py"
+  },
+  "trade-analyst": {
+    "description": "Analyze YM=F 15m with technical indicators, run paper trades in SQLite, and send Telegram summary",
+    "command": "python3 scripts/trade_analyst.py"
   }
 }
