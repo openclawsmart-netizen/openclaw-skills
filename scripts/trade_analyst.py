@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""Trade analyst skill for YM=F (15m).
+"""YM=F 15m trade analyst skill.
 
-Features:
-- Pull latest 2 days of 15m bars from yfinance
-- Compute EMA20/EMA50/RSI14/MACD(12,26,9)/Bollinger(20,2) using pandas_ta
-- Multi-factor analysis and simple AI plan (OpenAI if available, fallback rule engine)
-- SQLite paper-trading engine with SL/TP auto-close
-- Telegram summary notification (graceful skip if not configured)
+- Downloads recent 15m candles via yfinance (period=5d)
+- Computes EMA20/EMA50/RSI14/MACD(12,26,9) via pandas_ta
+- Settles/open paper trades in SQLite: data/trading_v1.db
+- Builds self-reflection from latest 5 closed trades
+- Generates plan with LLM (if OPENAI_API_KEY exists) or rule fallback
+- Sends Telegram summary via proactive-agent/send_telegram.py (graceful skip)
 """
 
 from __future__ import annotations
@@ -19,40 +19,38 @@ import sys
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 SYMBOL = "YM=F"
 INTERVAL = "15m"
-PERIOD = "2d"
+PERIOD = "5d"
 
-ROOT = Path(__file__).resolve().parents[1]
-DB_PATH = ROOT / "data" / "trading_v1.db"
-TELEGRAM_SENDER = ROOT / "proactive-agent" / "send_telegram.py"
+BASE_DIR = Path(__file__).resolve().parents[1]
+DB_PATH = BASE_DIR / "data" / "trading_v1.db"
+TELEGRAM_SCRIPT = BASE_DIR / "proactive-agent" / "send_telegram.py"
 
 
 @dataclass
-class MarketSnapshot:
-    price: float
+class Snapshot:
+    ts: str
+    close: float
     ema20: float
     ema50: float
     rsi14: float
     macd: float
     macd_signal: float
-    bb_lower: float
-    bb_middle: float
-    bb_upper: float
-    prev_macd: float
-    prev_macd_signal: float
 
 
 @dataclass
-class AIPlan:
-    sentiment: int
+class Plan:
+    sentiment_score: int
+    reflection_one_liner: str
     action: str
     entry: float
     sl: float
     tp: float
-    note: str = ""
+    reason: str
+    raw: str
 
 
 def eprint(msg: str) -> None:
@@ -63,7 +61,7 @@ def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def ensure_dependencies():
+def ensure_deps():
     try:
         import yfinance as yf  # type: ignore
     except ImportError:
@@ -85,25 +83,22 @@ def ensure_dependencies():
     return yf
 
 
-def fetch_and_compute(yf_module) -> MarketSnapshot:
+def fetch_snapshot(yf_module) -> Snapshot:
     try:
         df = yf_module.download(SYMBOL, period=PERIOD, interval=INTERVAL, progress=False, auto_adjust=False)
     except Exception as exc:
-        eprint(f"[error] Failed to fetch market data: {exc}")
+        eprint(f"[error] Failed to fetch market data from yfinance: {exc}")
         sys.exit(4)
 
     if df is None or df.empty:
         eprint("[error] No market data returned for YM=F")
         sys.exit(4)
 
-    # yfinance can return MultiIndex columns; flatten if needed.
     if hasattr(df.columns, "nlevels") and df.columns.nlevels > 1:
         df.columns = [c[0] if isinstance(c, tuple) else c for c in df.columns]
 
-    required = {"Close"}
-    missing = [c for c in required if c not in df.columns]
-    if missing:
-        eprint(f"[error] Missing required columns from data: {missing}")
+    if "Close" not in df.columns:
+        eprint("[error] Market data missing required column: Close")
         sys.exit(4)
 
     try:
@@ -114,7 +109,6 @@ def fetch_and_compute(yf_module) -> MarketSnapshot:
         df["EMA50"] = ta.ema(close, length=50)
         df["RSI14"] = ta.rsi(close, length=14)
         macd = ta.macd(close, fast=12, slow=26, signal=9)
-        bb = ta.bbands(close, length=20, std=2)
     except Exception as exc:
         eprint(f"[error] Indicator calculation failed: {exc}")
         sys.exit(5)
@@ -122,76 +116,32 @@ def fetch_and_compute(yf_module) -> MarketSnapshot:
     if macd is None or macd.empty:
         eprint("[error] MACD indicator returned empty data")
         sys.exit(5)
-    if bb is None or bb.empty:
-        eprint("[error] Bollinger Bands indicator returned empty data")
-        sys.exit(5)
 
-    # pandas_ta columns are usually MACD_12_26_9, MACDs_12_26_9 and BBL_20_2.0 etc.
     macd_col = next((c for c in macd.columns if c.startswith("MACD_")), None)
-    macd_signal_col = next((c for c in macd.columns if c.startswith("MACDs_")), None)
-    bbl_col = next((c for c in bb.columns if c.startswith("BBL_")), None)
-    bbm_col = next((c for c in bb.columns if c.startswith("BBM_")), None)
-    bbu_col = next((c for c in bb.columns if c.startswith("BBU_")), None)
-
-    if not all([macd_col, macd_signal_col, bbl_col, bbm_col, bbu_col]):
-        eprint("[error] Unexpected indicator column names from pandas_ta")
+    macds_col = next((c for c in macd.columns if c.startswith("MACDs_")), None)
+    if not macd_col or not macds_col:
+        eprint("[error] Unexpected MACD column names from pandas_ta")
         sys.exit(5)
 
     df["MACD"] = macd[macd_col]
-    df["MACD_SIGNAL"] = macd[macd_signal_col]
-    df["BBL"] = bb[bbl_col]
-    df["BBM"] = bb[bbm_col]
-    df["BBU"] = bb[bbu_col]
+    df["MACD_SIGNAL"] = macd[macds_col]
 
     df = df.dropna().copy()
-    if len(df) < 2:
-        eprint("[error] Not enough rows after indicator calculation")
+    if df.empty:
+        eprint("[error] Not enough rows after indicators (dropna produced empty dataframe)")
         sys.exit(5)
 
     latest = df.iloc[-1]
-    prev = df.iloc[-2]
-
-    return MarketSnapshot(
-        price=float(latest["Close"]),
+    ts = str(df.index[-1])
+    return Snapshot(
+        ts=ts,
+        close=float(latest["Close"]),
         ema20=float(latest["EMA20"]),
         ema50=float(latest["EMA50"]),
         rsi14=float(latest["RSI14"]),
         macd=float(latest["MACD"]),
         macd_signal=float(latest["MACD_SIGNAL"]),
-        bb_lower=float(latest["BBL"]),
-        bb_middle=float(latest["BBM"]),
-        bb_upper=float(latest["BBU"]),
-        prev_macd=float(prev["MACD"]),
-        prev_macd_signal=float(prev["MACD_SIGNAL"]),
     )
-
-
-def get_trend(s: MarketSnapshot) -> str:
-    if s.price > s.ema20 > s.ema50:
-        return "強多頭"
-    if s.price < s.ema20 < s.ema50:
-        return "強空頭"
-    return "中性"
-
-
-def get_signals(s: MarketSnapshot) -> Dict[str, str]:
-    if s.rsi14 >= 70:
-        rsi_signal = "RSI超買"
-    elif s.rsi14 <= 30:
-        rsi_signal = "RSI超賣"
-    else:
-        rsi_signal = "RSI中性"
-
-    cross_up = s.prev_macd <= s.prev_macd_signal and s.macd > s.macd_signal
-    cross_down = s.prev_macd >= s.prev_macd_signal and s.macd < s.macd_signal
-    if cross_up:
-        macd_signal = "MACD金叉"
-    elif cross_down:
-        macd_signal = "MACD死叉"
-    else:
-        macd_signal = "MACD無明確交叉"
-
-    return {"rsi": rsi_signal, "macd": macd_signal}
 
 
 def ensure_db(conn: sqlite3.Connection) -> None:
@@ -199,61 +149,63 @@ def ensure_db(conn: sqlite3.Connection) -> None:
         """
         CREATE TABLE IF NOT EXISTS trades (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            symbol TEXT NOT NULL,
-            side TEXT NOT NULL,
-            entry_price REAL NOT NULL,
-            sl REAL NOT NULL,
-            tp REAL NOT NULL,
-            status TEXT NOT NULL,
-            opened_at TEXT NOT NULL,
+            symbol TEXT,
+            opened_at TEXT,
+            side TEXT,
+            entry_price REAL,
+            sl REAL,
+            tp REAL,
+            reason TEXT,
+            status TEXT,
             closed_at TEXT,
             close_price REAL,
             pnl REAL,
-            ai_sentiment INTEGER,
-            ai_action TEXT,
-            note TEXT
+            ai_reflection TEXT,
+            ai_plan_raw TEXT
         )
         """
     )
     conn.commit()
 
 
-def settle_open_trades(conn: sqlite3.Connection, latest_price: float) -> int:
+def settle_open_trades(conn: sqlite3.Connection, price: float) -> int:
     rows = conn.execute(
-        "SELECT id, side, entry_price, sl, tp FROM trades WHERE status='open'"
+        "SELECT id, side, entry_price, sl, tp FROM trades WHERE status='OPEN'"
     ).fetchall()
-
     closed = 0
-    for trade_id, side, entry_price, sl, tp in rows:
-        side_u = str(side).upper()
-        hit = None
-        close_px = None
 
-        if side_u == "BUY":
-            if latest_price <= sl:
-                hit = "sl"
-                close_px = sl
-            elif latest_price >= tp:
-                hit = "tp"
-                close_px = tp
-            pnl = (close_px - entry_price) if close_px is not None else None
-        else:  # SELL
-            if latest_price >= sl:
-                hit = "sl"
-                close_px = sl
-            elif latest_price <= tp:
-                hit = "tp"
-                close_px = tp
-            pnl = (entry_price - close_px) if close_px is not None else None
+    for trade_id, side, entry, sl, tp in rows:
+        side = str(side).upper()
+        outcome = None
+        close_price = None
 
-        if hit and close_px is not None and pnl is not None:
+        if side == "LONG":
+            if price <= float(sl):
+                outcome = "LOSS"
+                close_price = float(sl)
+            elif price >= float(tp):
+                outcome = "WIN"
+                close_price = float(tp)
+            pnl = (close_price - float(entry)) if close_price is not None else None
+        elif side == "SHORT":
+            if price >= float(sl):
+                outcome = "LOSS"
+                close_price = float(sl)
+            elif price <= float(tp):
+                outcome = "WIN"
+                close_price = float(tp)
+            pnl = (float(entry) - close_price) if close_price is not None else None
+        else:
+            continue
+
+        if outcome and close_price is not None and pnl is not None:
             conn.execute(
                 """
                 UPDATE trades
-                SET status='closed', closed_at=?, close_price=?, pnl=?, note=COALESCE(note,'') || ?
+                SET status=?, closed_at=?, close_price=?, pnl=?
                 WHERE id=?
                 """,
-                (now_iso(), float(close_px), float(pnl), f" | auto-close:{hit}", trade_id),
+                (outcome, now_iso(), close_price, float(pnl), trade_id),
             )
             closed += 1
 
@@ -261,69 +213,121 @@ def settle_open_trades(conn: sqlite3.Connection, latest_price: float) -> int:
     return closed
 
 
-def has_open_trade(conn: sqlite3.Connection) -> bool:
-    row = conn.execute("SELECT 1 FROM trades WHERE status='open' LIMIT 1").fetchone()
-    return row is not None
+def get_reflection(conn: sqlite3.Connection) -> Tuple[float, List[str], str]:
+    rows = conn.execute(
+        """
+        SELECT reason, pnl, status
+        FROM trades
+        WHERE status IN ('WIN','LOSS','CLOSED') AND closed_at IS NOT NULL
+        ORDER BY datetime(closed_at) DESC
+        LIMIT 5
+        """
+    ).fetchall()
+
+    if not rows:
+        return 0.0, [], "No closed trade history yet."
+
+    win_count = sum(1 for _, _, st in rows if str(st).upper() == "WIN")
+    total = len(rows)
+    winrate = (win_count / total) * 100.0 if total else 0.0
+
+    items: List[str] = []
+    for reason, pnl, status in rows:
+        reason_s = (reason or "(no reason)").strip()
+        pnl_v = float(pnl or 0.0)
+        status_s = str(status or "").upper()
+        items.append(f"- {status_s} | PnL={pnl_v:.2f} | reason={reason_s}")
+
+    summary = (
+        f"Last {total} closed trades winrate={winrate:.1f}%. "
+        + " ".join([f"[{i}]" for i in items])
+    )
+    return winrate, items, summary
 
 
-def cumulative_pnl(conn: sqlite3.Connection) -> float:
-    row = conn.execute("SELECT COALESCE(SUM(pnl), 0) FROM trades WHERE status='closed'").fetchone()
-    return float(row[0] if row and row[0] is not None else 0.0)
-
-
-def clamp(n: float, a: float, b: float) -> float:
-    return max(a, min(b, n))
-
-
-def fallback_plan(trend: str, signals: Dict[str, str], s: MarketSnapshot) -> AIPlan:
-    sentiment = 50
-    action = "HOLD"
-
-    if trend == "強多頭":
-        sentiment += 20
-    elif trend == "強空頭":
-        sentiment -= 20
-
-    if signals["rsi"] == "RSI超賣":
-        sentiment += 12
-    elif signals["rsi"] == "RSI超買":
-        sentiment -= 12
-
-    if signals["macd"] == "MACD金叉":
-        sentiment += 10
-    elif signals["macd"] == "MACD死叉":
-        sentiment -= 10
-
-    sentiment = int(clamp(sentiment, 0, 100))
-
-    if sentiment >= 60:
-        action = "BUY"
-    elif sentiment <= 40:
-        action = "SELL"
-
-    entry = s.price
-    width = max(20.0, abs(s.bb_upper - s.bb_lower) * 0.6)
-    if action == "BUY":
-        sl = entry - width
-        tp = entry + width * 1.5
-    elif action == "SELL":
-        sl = entry + width
-        tp = entry - width * 1.5
-    else:
-        sl = entry - width
-        tp = entry + width
-
-    return AIPlan(
-        sentiment=sentiment,
-        action=action,
-        entry=round(entry, 2),
-        sl=round(sl, 2),
-        tp=round(tp, 2),
-        note="rule-engine",
+def trend_summary(s: Snapshot) -> str:
+    trend = "震盪"
+    if s.close > s.ema20 > s.ema50:
+        trend = "多頭"
+    elif s.close < s.ema20 < s.ema50:
+        trend = "空頭"
+    return (
+        f"{trend} | Close={s.close:.2f}, EMA20={s.ema20:.2f}, EMA50={s.ema50:.2f}, "
+        f"RSI14={s.rsi14:.2f}, MACD={s.macd:.3f}/{s.macd_signal:.3f}"
     )
 
 
-def try_openai_plan(trend: str, signals: Dict[str, str], s: MarketSnapshot) -> Optional[AIPlan]:
+def safe_float(v: Any, default: float) -> float:
+    try:
+        return float(v)
+    except Exception:
+        return default
+
+
+def clamp(v: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, v))
+
+
+def rule_plan(s: Snapshot, winrate: float, history_summary: str) -> Plan:
+    score = 50
+    if s.close > s.ema20 > s.ema50:
+        score += 18
+    elif s.close < s.ema20 < s.ema50:
+        score -= 18
+
+    if s.rsi14 < 30:
+        score += 10
+    elif s.rsi14 > 70:
+        score -= 10
+
+    if s.macd > s.macd_signal:
+        score += 7
+    else:
+        score -= 7
+
+    score = int(clamp(score, 0, 100))
+
+    action = "HOLD"
+    if score >= 60:
+        action = "LONG"
+    elif score <= 40:
+        action = "SHORT"
+
+    entry = s.close
+    band = max(s.close * 0.002, 25.0)
+    if action == "LONG":
+        sl = entry - band
+        tp = entry + band * 1.6
+    elif action == "SHORT":
+        sl = entry + band
+        tp = entry - band * 1.6
+    else:
+        sl = entry - band
+        tp = entry + band
+
+    refl = "依規則引擎：延續優勢訊號"
+    if winrate < 50:
+        refl = "近期勝率偏低，已收斂風險並修正進場條件"
+
+    reason = f"Fallback engine based on EMA/RSI/MACD. history={history_summary}"
+    raw = json.dumps(
+        {
+            "source": "rule_engine",
+            "sentiment_score": score,
+            "reflection_one_liner": refl,
+            "action": action,
+            "entry": round(entry, 2),
+            "sl": round(sl, 2),
+            "tp": round(tp, 2),
+            "reason": reason,
+        },
+        ensure_ascii=False,
+    )
+
+    return Plan(score, refl, action, round(entry, 2), round(sl, 2), round(tp, 2), reason, raw)
+
+
+def llm_plan(s: Snapshot, winrate: float, history_summary: str) -> Optional[Plan]:
     api_key = (os.getenv("OPENAI_API_KEY") or "").strip()
     if not api_key:
         return None
@@ -331,159 +335,161 @@ def try_openai_plan(trend: str, signals: Dict[str, str], s: MarketSnapshot) -> O
     try:
         import requests  # type: ignore
     except ImportError:
-        eprint("[warn] OPENAI_API_KEY present but requests missing; fallback to rule engine")
+        eprint("[warn] OPENAI_API_KEY is set but requests is missing; fallback to rule engine")
         return None
 
-    model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-    url = "https://api.openai.com/v1/chat/completions"
-    prompt = {
-        "symbol": SYMBOL,
-        "interval": INTERVAL,
-        "trend": trend,
-        "signals": signals,
-        "price": s.price,
-        "ema20": s.ema20,
-        "ema50": s.ema50,
-        "rsi14": s.rsi14,
-        "macd": s.macd,
-        "macd_signal": s.macd_signal,
-        "bb_lower": s.bb_lower,
-        "bb_middle": s.bb_middle,
-        "bb_upper": s.bb_upper,
-    }
-
-    sys_msg = (
-        "You are a futures trading planning assistant. Return only JSON with keys: "
-        "sentiment(0-100 int), action(BUY/SELL/HOLD), entry(number), sl(number), tp(number), note(string)."
+    model = (os.getenv("OPENAI_MODEL") or "gpt-4o-mini").strip()
+    sys_prompt = (
+        "You are a futures trading strategist for YM=F 15m paper trading. "
+        "Output ONLY JSON with keys: sentiment_score, reflection_one_liner, action, entry, sl, tp, reason. "
+        "action must be LONG, SHORT, or HOLD. sentiment_score must be 0-100 integer."
     )
-    user_msg = f"Create one short-term plan using this market snapshot: {json.dumps(prompt, ensure_ascii=False)}"
+
+    extra = ""
+    if winrate < 50:
+        extra = "必須輸出：失敗檢討與策略修正，並放在 reflection_one_liner/reason 內。"
+
+    user_prompt = (
+        f"歷史反思：最近5筆勝率 {winrate:.1f}%\n"
+        f"歷史摘要：{history_summary}\n"
+        f"{extra}\n"
+        "當下決策：根據最新K線與指標，結合歷史教訓，給 direction/entry/sl/tp/action。\n"
+        f"最新資料: ts={s.ts}, close={s.close}, EMA20={s.ema20}, EMA50={s.ema50}, "
+        f"RSI14={s.rsi14}, MACD={s.macd}, MACD_SIGNAL={s.macd_signal}"
+    )
 
     payload = {
         "model": model,
         "temperature": 0.2,
         "messages": [
-            {"role": "system", "content": sys_msg},
-            {"role": "user", "content": user_msg},
+            {"role": "system", "content": sys_prompt},
+            {"role": "user", "content": user_prompt},
         ],
         "response_format": {"type": "json_object"},
     }
 
     try:
         resp = requests.post(
-            url,
+            "https://api.openai.com/v1/chat/completions",
             headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
             json=payload,
-            timeout=20,
+            timeout=30,
         )
         if resp.status_code != 200:
-            eprint(f"[warn] OpenAI API HTTP {resp.status_code}; fallback to rule engine")
+            eprint(f"[warn] OpenAI HTTP {resp.status_code}; fallback to rule engine")
             return None
-        data = resp.json()
-        content = data["choices"][0]["message"]["content"]
-        parsed: Dict[str, Any] = json.loads(content)
 
-        sentiment = int(clamp(float(parsed.get("sentiment", 50)), 0, 100))
-        action = str(parsed.get("action", "HOLD")).upper()
-        if action not in {"BUY", "SELL", "HOLD"}:
+        body = resp.json()
+        text = body["choices"][0]["message"]["content"]
+        parsed = json.loads(text)
+
+        sentiment = int(clamp(safe_float(parsed.get("sentiment_score"), 50), 0, 100))
+        action = str(parsed.get("action", "HOLD")).upper().strip()
+        if action not in {"LONG", "SHORT", "HOLD"}:
             action = "HOLD"
 
-        entry = float(parsed.get("entry", s.price))
-        sl = float(parsed.get("sl", s.price))
-        tp = float(parsed.get("tp", s.price))
-        note = str(parsed.get("note", "llm"))
+        entry = round(safe_float(parsed.get("entry"), s.close), 2)
+        sl = round(safe_float(parsed.get("sl"), s.close), 2)
+        tp = round(safe_float(parsed.get("tp"), s.close), 2)
+        reflection = str(parsed.get("reflection_one_liner", ""))[:220] or "N/A"
+        reason = str(parsed.get("reason", ""))[:800] or "N/A"
 
-        return AIPlan(sentiment, action, round(entry, 2), round(sl, 2), round(tp, 2), note)
+        return Plan(sentiment, reflection, action, entry, sl, tp, reason, text)
     except Exception as exc:
-        eprint(f"[warn] OpenAI plan failed ({exc}); fallback to rule engine")
+        eprint(f"[warn] OpenAI planning failed ({exc}); fallback to rule engine")
         return None
 
 
-def maybe_open_trade(conn: sqlite3.Connection, plan: AIPlan, trend: str) -> bool:
+def has_open_trade(conn: sqlite3.Connection) -> bool:
+    row = conn.execute("SELECT 1 FROM trades WHERE status='OPEN' LIMIT 1").fetchone()
+    return row is not None
+
+
+def maybe_open_trade(conn: sqlite3.Connection, p: Plan) -> bool:
     if has_open_trade(conn):
         return False
 
-    if plan.action not in {"BUY", "SELL"}:
-        return False
-
-    # Keep a simple guard to avoid opening against strong opposite trend.
-    if trend == "強空頭" and plan.action == "BUY":
-        return False
-    if trend == "強多頭" and plan.action == "SELL":
+    if p.action not in {"LONG", "SHORT"}:
         return False
 
     conn.execute(
         """
-        INSERT INTO trades
-        (symbol, side, entry_price, sl, tp, status, opened_at, ai_sentiment, ai_action, note)
-        VALUES (?, ?, ?, ?, ?, 'open', ?, ?, ?, ?)
+        INSERT INTO trades (
+            symbol, opened_at, side, entry_price, sl, tp, reason, status,
+            ai_reflection, ai_plan_raw
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, 'OPEN', ?, ?)
         """,
-        (SYMBOL, plan.action, plan.entry, plan.sl, plan.tp, now_iso(), plan.sentiment, plan.action, plan.note),
+        (
+            SYMBOL,
+            now_iso(),
+            p.action,
+            p.entry,
+            p.sl,
+            p.tp,
+            p.reason,
+            p.reflection_one_liner,
+            p.raw,
+        ),
     )
     conn.commit()
     return True
 
 
-def send_telegram_summary(trend: str, rsi: float, action: str, price: float, total_pnl: float) -> None:
-    message = (
-        "📊 道瓊期貨分析 (15m)\n"
-        f"📈 趨勢：{trend} | RSI：{rsi:.2f}\n"
-        f"🤖 AI 建議：{action} (Entry: {price:.2f})\n"
-        f"💰 累計模擬損益：{total_pnl:.2f}"
+def telegram_summary(winrate: float, reflection: str, trend: str, p: Plan) -> str:
+    return (
+        "📊 道瓊期貨 AI 交易員 (15m)\n"
+        f"🧠 自我檢討：{winrate:.1f}% - {reflection}\n"
+        f"📈 當前盤勢：{trend}\n"
+        f"🤖 最新計畫：{p.action} (Entry: {p.entry:.2f}, SL: {p.sl:.2f}, TP: {p.tp:.2f})"
     )
 
-    if not TELEGRAM_SENDER.exists():
-        print("[skip] Telegram sender script not found")
-        return
 
-    result = subprocess.run(
-        [sys.executable, str(TELEGRAM_SENDER), "--message", message],
+def send_telegram(msg: str) -> str:
+    if not TELEGRAM_SCRIPT.exists():
+        return "skip: sender script not found"
+
+    proc = subprocess.run(
+        [sys.executable, str(TELEGRAM_SCRIPT), "--message", msg],
+        cwd=str(BASE_DIR),
         capture_output=True,
         text=True,
     )
 
-    if result.returncode == 0:
-        print("[ok] Telegram summary sent")
-        return
-
-    # send_telegram.py uses 2 for missing env; skip gracefully.
-    if result.returncode == 2:
-        print("[skip] Telegram not configured")
-        return
-
-    stderr = (result.stderr or "").strip()
-    print(f"[warn] Telegram send failed (code={result.returncode}) {stderr}")
+    if proc.returncode == 0:
+        return "sent"
+    if proc.returncode == 2:
+        return "skip: telegram not configured"
+    err = (proc.stderr or proc.stdout or "").strip()
+    return f"warn: telegram failed rc={proc.returncode} {err}"
 
 
 def main() -> int:
-    yf = ensure_dependencies()
-    snapshot = fetch_and_compute(yf)
-
-    trend = get_trend(snapshot)
-    signals = get_signals(snapshot)
+    yf = ensure_deps()
+    s = fetch_snapshot(yf)
 
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(DB_PATH)
     try:
         ensure_db(conn)
-        closed_count = settle_open_trades(conn, snapshot.price)
-
-        plan = try_openai_plan(trend, signals, snapshot) or fallback_plan(trend, signals, snapshot)
-        opened = maybe_open_trade(conn, plan, trend)
-        total_pnl = cumulative_pnl(conn)
+        closed = settle_open_trades(conn, s.close)
+        winrate, _, history_summary = get_reflection(conn)
+        plan = llm_plan(s, winrate, history_summary) or rule_plan(s, winrate, history_summary)
+        opened = maybe_open_trade(conn, plan)
     finally:
         conn.close()
 
-    print(f"[info] Symbol={SYMBOL} Price={snapshot.price:.2f} Trend={trend}")
-    print(f"[info] RSI={snapshot.rsi14:.2f} MACD={snapshot.macd:.4f}/{snapshot.macd_signal:.4f}")
-    print(f"[info] Signals: {signals['rsi']}, {signals['macd']}")
-    print(
-        f"[info] Plan: sentiment={plan.sentiment} action={plan.action} "
-        f"entry={plan.entry:.2f} sl={plan.sl:.2f} tp={plan.tp:.2f} source={plan.note}"
-    )
-    print(f"[info] Trades updated: closed={closed_count}, opened_new={opened}")
-    print(f"[info] Cumulative closed PnL={total_pnl:.2f}")
+    trend = trend_summary(s)
+    tg_state = send_telegram(telegram_summary(winrate, plan.reflection_one_liner, trend, plan))
 
-    send_telegram_summary(trend, snapshot.rsi14, plan.action, plan.entry, total_pnl)
+    print(f"[info] Symbol={SYMBOL} interval={INTERVAL} ts={s.ts}")
+    print(f"[info] Indicators: Close={s.close:.2f} EMA20={s.ema20:.2f} EMA50={s.ema50:.2f} RSI14={s.rsi14:.2f} MACD={s.macd:.3f}/{s.macd_signal:.3f}")
+    print(f"[info] Reflection winrate(last5)={winrate:.1f}%")
+    print(
+        f"[info] Plan: sentiment_score={plan.sentiment_score} action={plan.action} "
+        f"entry={plan.entry:.2f} sl={plan.sl:.2f} tp={plan.tp:.2f}"
+    )
+    print(f"[info] Trades: settled_open={closed}, opened_new={opened}")
+    print(f"[info] Telegram: {tg_state}")
     return 0
 
 
