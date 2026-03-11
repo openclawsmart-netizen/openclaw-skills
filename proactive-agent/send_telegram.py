@@ -1,10 +1,15 @@
 #!/usr/bin/env python3
 import argparse
+import os
+import re
 import sys
 from pathlib import Path
 from typing import Dict
 
 DEFAULT_ENV_PATH = Path("/root/.openclaw_env")
+
+
+_ENV_LINE_RE = re.compile(r"^(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$")
 
 
 def load_kv_env(env_path: Path) -> Dict[str, str]:
@@ -14,15 +19,17 @@ def load_kv_env(env_path: Path) -> Dict[str, str]:
 
     for raw in env_path.read_text(encoding="utf-8", errors="ignore").splitlines():
         line = raw.strip()
-        if not line or line.startswith("#") or "=" not in line:
+        if not line or line.startswith("#"):
             continue
-        key, val = line.split("=", 1)
-        key = key.strip()
-        if not key:
+
+        match = _ENV_LINE_RE.match(line)
+        if not match:
             continue
-        val = val.strip()
+
+        key, val = match.group(1), match.group(2).strip()
         if (val.startswith('"') and val.endswith('"')) or (val.startswith("'") and val.endswith("'")):
             val = val[1:-1]
+
         values[key] = val
 
     return values
@@ -31,7 +38,11 @@ def load_kv_env(env_path: Path) -> Dict[str, str]:
 def parse_args():
     parser = argparse.ArgumentParser(description="Send Telegram message via Bot API")
     parser.add_argument("--message", required=True, help="Message text")
-    parser.add_argument("--env-file", default=str(DEFAULT_ENV_PATH), help="Path to env file (default: /root/.openclaw_env)")
+    parser.add_argument(
+        "--env-file",
+        default=os.getenv("OPENCLAW_ENV_FILE", str(DEFAULT_ENV_PATH)),
+        help="Path to env file (default: OPENCLAW_ENV_FILE or /root/.openclaw_env)",
+    )
     parser.add_argument("--timeout", type=float, default=10.0, help="Request timeout in seconds")
     return parser.parse_args()
 
@@ -47,12 +58,13 @@ def main() -> int:
 
     env_path = Path(args.env_file)
     env = load_kv_env(env_path)
-    token = env.get("TELEGRAM_BOT_TOKEN", "").strip()
-    chat_id = env.get("TELEGRAM_CHAT_ID", "").strip()
+
+    token = (os.getenv("TELEGRAM_BOT_TOKEN") or "").strip() or env.get("TELEGRAM_BOT_TOKEN", "").strip()
+    chat_id = (os.getenv("TELEGRAM_CHAT_ID") or "").strip() or env.get("TELEGRAM_CHAT_ID", "").strip()
 
     if not token or not chat_id:
         print(
-            f"[skip] Telegram env not configured in {env_path} (need TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID)",
+            f"[skip] Telegram env not configured (need TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID; env file: {env_path})",
             file=sys.stderr,
         )
         return 2

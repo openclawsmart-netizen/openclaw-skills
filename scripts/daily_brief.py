@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import re
 import subprocess
 import sys
@@ -14,6 +15,7 @@ from bs4 import BeautifulSoup
 DEFAULT_URL = "https://github.com/trending"
 BASE_DIR = Path(__file__).resolve().parent.parent
 DEFAULT_TELEGRAM_SCRIPT = BASE_DIR / "proactive-agent" / "send_telegram.py"
+DEFAULT_ENV_FILE = Path(os.getenv("OPENCLAW_ENV_FILE", "/root/.openclaw_env"))
 
 
 def _clean(text: str) -> str:
@@ -65,31 +67,29 @@ def format_brief(url: str, items: List[str]) -> str:
     return "\n".join(lines)
 
 
-def send_telegram(message: str, script_path: Path) -> int:
-    if not script_path.exists():
-        print(f"[skip] Telegram sender not found: {script_path}")
-        return 0
+def send_telegram(message: str, script_path: Path, env_file: Path) -> int:
+    resolved_script = script_path if script_path.is_absolute() else (BASE_DIR / script_path).resolve()
+
+    if not resolved_script.exists():
+        print(f"[error] Telegram sender not found: {resolved_script}", file=sys.stderr)
+        return 1
 
     proc = subprocess.run(
-        [sys.executable, str(script_path), "--message", message],
+        [sys.executable, str(resolved_script), "--message", message, "--env-file", str(env_file)],
         capture_output=True,
         text=True,
         check=False,
+        cwd=str(BASE_DIR),
     )
 
-    # send_telegram.py rc=2 when env missing -> graceful skip
-    if proc.returncode in (0, 2):
-        out = (proc.stdout or "").strip()
-        err = (proc.stderr or "").strip()
-        if out:
-            print(out)
-        if err:
-            print(err)
-        return 0
+    out = (proc.stdout or "").strip()
+    err = (proc.stderr or "").strip()
+    if out:
+        print(out)
+    if err:
+        print(err)
 
-    detail = (proc.stderr or proc.stdout or "").strip()
-    print(f"[warn] Telegram send failed (rc={proc.returncode}): {detail}")
-    return 0
+    return proc.returncode
 
 
 def parse_args() -> argparse.Namespace:
@@ -98,6 +98,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--top", type=int, default=5, help="How many titles to include")
     parser.add_argument("--timeout", type=float, default=15.0, help="HTTP timeout seconds")
     parser.add_argument("--telegram-script", default=str(DEFAULT_TELEGRAM_SCRIPT), help="Path to send_telegram.py")
+    parser.add_argument("--env-file", default=str(DEFAULT_ENV_FILE), help="Path to env file for Telegram credentials")
     parser.add_argument("--print-only", action="store_true", help="Only print brief, do not send")
     return parser.parse_args()
 
@@ -121,7 +122,7 @@ def main() -> int:
     if args.print_only:
         return 0
 
-    return send_telegram(brief, Path(args.telegram_script))
+    return send_telegram(brief, Path(args.telegram_script), Path(args.env_file))
 
 
 if __name__ == "__main__":
