@@ -108,6 +108,96 @@ def is_futures_market_closed_taipei(now_tpe: datetime) -> bool:
     return False
 
 
+
+
+
+
+def get_us_eastern_zone() -> Optional[ZoneInfo]:
+    for tz_name in ("US/Eastern", "America/New_York"):
+        try:
+            return ZoneInfo(tz_name)
+        except Exception:
+            continue
+    eprint("[warn] 無法載入 US/Eastern 時區資料，將略過美國國定假日檢查並繼續執行。")
+    return None
+def ensure_holidays_module():
+    try:
+        import holidays  # type: ignore
+
+        return holidays
+    except ImportError:
+        eprint("[warn] Missing dependency: holidays. Trying to install via pip3...")
+
+    try:
+        proc = subprocess.run(
+            ["pip3", "install", "holidays", "--break-system-packages"],
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+    except Exception as exc:
+        eprint(f"[warn] Failed to run pip3 install holidays: {exc}")
+        eprint("[warn] 無法啟用美國國定假日檢查，將略過此檢查並繼續執行。")
+        return None
+
+    if proc.returncode != 0:
+        err = (proc.stderr or proc.stdout or "").strip()
+        eprint(f"[warn] pip3 install holidays failed (rc={proc.returncode}): {err}")
+        eprint("[warn] 無法啟用美國國定假日檢查，將略過此檢查並繼續執行。")
+        return None
+
+    try:
+        import holidays  # type: ignore
+
+        return holidays
+    except ImportError:
+        eprint("[warn] holidays 安裝後仍無法載入，將略過美國國定假日檢查並繼續執行。")
+        return None
+
+
+def get_us_holiday_name_from_taipei(
+    now_tpe: datetime,
+    holidays_module=None,
+    holidays_calendar: Optional[Dict[Any, Any]] = None,
+) -> Optional[str]:
+    if now_tpe.tzinfo is None:
+        now_tpe = now_tpe.replace(tzinfo=ZoneInfo("Asia/Taipei"))
+    else:
+        now_tpe = now_tpe.astimezone(ZoneInfo("Asia/Taipei"))
+
+    eastern_tz = get_us_eastern_zone()
+    if eastern_tz is None:
+        return None
+
+    now_eastern = now_tpe.astimezone(eastern_tz)
+    eastern_date = now_eastern.date()
+
+    if holidays_calendar is None:
+        if holidays_module is None:
+            return None
+        try:
+            holidays_calendar = holidays_module.US(years=now_eastern.year)
+        except Exception as exc:
+            eprint(f"[warn] 美國假日資料初始化失敗: {exc}")
+            return None
+
+    if eastern_date in holidays_calendar:
+        return str(holidays_calendar[eastern_date])
+    return None
+
+
+def _run_holiday_guard_selftest() -> None:
+    now_tpe = datetime.fromisoformat("2026-07-03T12:00:00+08:00")
+    fake_holidays = {
+        now_tpe.astimezone(ZoneInfo("America/New_York")).date(): "Independence Day (observed)"
+    }
+    holiday_name = get_us_holiday_name_from_taipei(
+        now_tpe=now_tpe,
+        holidays_module=None,
+        holidays_calendar=fake_holidays,
+    )
+    if holiday_name != "Independence Day (observed)":
+        raise AssertionError(f"holiday guard selftest failed: got={holiday_name}")
 def _run_time_guard_selftest() -> None:
     tz = ZoneInfo("Asia/Taipei")
     cases = [
@@ -667,9 +757,20 @@ def main() -> int:
         print("[info] Time guard selftest passed")
         return 0
 
+    if (os.getenv("TRADE_ANALYST_HOLIDAY_GUARD_SELFTEST") or "").strip() == "1":
+        _run_holiday_guard_selftest()
+        print("[info] Holiday guard selftest passed")
+        return 0
+
     now_tpe = get_taipei_now((os.getenv("TRADE_ANALYST_NOW") or "").strip() or None)
     if is_futures_market_closed_taipei(now_tpe):
         print("[Info] 目前為期貨休市時間 (每日保養或週末)，暫停分析與交易。")
+        sys.exit(0)
+
+    holidays_module = ensure_holidays_module()
+    holiday_name = get_us_holiday_name_from_taipei(now_tpe, holidays_module=holidays_module)
+    if holiday_name:
+        print(f"[Info] 今日為美國國定假日 ({holiday_name})，期貨市場可能休市或提早收盤，暫停分析與交易。")
         sys.exit(0)
 
     yf = ensure_deps()
