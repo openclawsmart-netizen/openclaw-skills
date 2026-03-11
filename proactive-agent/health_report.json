@@ -1,0 +1,22 @@
+{
+  "timestamp": "2026-03-11T14:10:14.102000+00:00",
+  "status": "warning",
+  "metrics": {
+    "cpu_percent": 0.0,
+    "ram_percent": 26.29,
+    "disk_percent": 2.24,
+    "source": "fallback"
+  },
+  "log_check": {
+    "log_dir": "/root/session-logs",
+    "latest_file": null,
+    "latest_file_age_hours": null,
+    "stale_threshold_hours": 24.0
+  },
+  "thresholds": {
+    "disk_percent_warning": 90.0
+  },
+  "warnings": [
+    "No logs found in /root/session-logs"
+  ]
+}
