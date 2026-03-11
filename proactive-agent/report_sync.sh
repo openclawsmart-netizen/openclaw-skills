@@ -2,12 +2,16 @@
 set -euo pipefail
 
 # Load shell environment for git/gh if available
+set +u
+if [[ -f /root/.openclaw_env ]]; then
+  # shellcheck disable=SC1091
+  source /root/.openclaw_env
+fi
 if [[ -f /root/.bashrc ]]; then
   # shellcheck disable=SC1091
-  set +u
   source /root/.bashrc
-  set -u
 fi
+set -u
 
 REPO_DIR="/root/openclaw-skills"
 cd "$REPO_DIR"

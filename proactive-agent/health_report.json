@@ -1,9 +1,9 @@
 {
-  "timestamp": "2026-03-11T14:10:14.102000+00:00",
+  "timestamp": "2026-03-11T14:14:34.284567+00:00",
   "status": "warning",
   "metrics": {
-    "cpu_percent": 0.0,
-    "ram_percent": 26.29,
+    "cpu_percent": 0.5,
+    "ram_percent": 28.19,
     "disk_percent": 2.24,
     "source": "fallback"
   },
@@ -14,9 +14,45 @@
     "stale_threshold_hours": 24.0
   },
   "thresholds": {
-    "disk_percent_warning": 90.0
+    "disk_percent_warning": 85.0
   },
+  "healer": {
+    "force_disk_high": true,
+    "disk_triggered": true,
+    "cleanup_days": 7,
+    "safe_clean_dirs": [
+      "/root/openclaw-skills/proactive-agent",
+      "/root/session-logs"
+    ]
+  },
+  "actions_taken": [
+    {
+      "timestamp": "2026-03-11T14:14:34.283568+00:00",
+      "action": "gh_check",
+      "success": true,
+      "details": "gh version 2.45.0 (2025-07-18 Ubuntu 2.45.0-1ubuntu0.3)"
+    },
+    {
+      "timestamp": "2026-03-11T14:14:34.284548+00:00",
+      "action": "disk_log_cleanup",
+      "success": true,
+      "details": "disk=2.24% (effective=85.01%) > 85.0%, removed=1, errors=0",
+      "cleanup": {
+        "removed_count": 1,
+        "removed_files": [
+          "/root/openclaw-skills/proactive-agent/tmp_old_cleanup_test.log"
+        ],
+        "skipped_dirs": [
+          "/root/session-logs (not found)"
+        ],
+        "errors": [],
+        "days_threshold": 7
+      },
+      "forced": true
+    }
+  ],
   "warnings": [
+    "Disk high simulation enabled (forced trigger)",
     "No logs found in /root/session-logs"
   ]
 }
