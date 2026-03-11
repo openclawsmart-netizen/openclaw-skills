@@ -22,5 +22,9 @@
   "trade-analyst": {
     "description": "Analyze YM=F 15m with technical indicators, run paper trades in SQLite, and send Telegram summary",
     "command": "python3 scripts/trade_analyst.py"
+  },
+  "ai-orchestrator": {
+    "description": "Orchestrate YM=F 15m analysis with Gemini strategy + Groq risk check and send Telegram summary",
+    "command": "python3 scripts/ai_orchestrator.py"
   }
 }

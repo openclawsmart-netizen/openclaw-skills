@@ -17,6 +17,7 @@ Examples:
   ./run-skill.sh daily-brief --url https://news.ycombinator.com --top 3
   ./run-skill.sh system-status
   ./run-skill.sh trade-analyst
+  ./run-skill.sh ai-orchestrator
 EOF
 }
 
