@@ -18,6 +18,7 @@ import subprocess
 import sys
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -68,6 +69,63 @@ def eprint(msg: str) -> None:
 
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def get_taipei_now(override_iso: Optional[str] = None) -> datetime:
+    tz = ZoneInfo("Asia/Taipei")
+    if override_iso:
+        parsed = datetime.fromisoformat(override_iso)
+        if parsed.tzinfo is None:
+            return parsed.replace(tzinfo=tz)
+        return parsed.astimezone(tz)
+    return datetime.now(tz)
+
+
+def is_futures_market_closed_taipei(now_tpe: datetime) -> bool:
+    if now_tpe.tzinfo is None:
+        now_tpe = now_tpe.replace(tzinfo=ZoneInfo("Asia/Taipei"))
+    else:
+        now_tpe = now_tpe.astimezone(ZoneInfo("Asia/Taipei"))
+
+    weekday = now_tpe.weekday()  # Mon=0 ... Sun=6
+    hhmmss = now_tpe.time()
+
+    # 每日保養時段：05:00:00 ~ 05:59:59
+    if 5 <= now_tpe.hour < 6:
+        return True
+
+    # 週末休市：
+    # a) 週六 05:00 之後
+    if weekday == 5 and hhmmss >= datetime.strptime("05:00:00", "%H:%M:%S").time():
+        return True
+    # b) 整個週日
+    if weekday == 6:
+        return True
+    # c) 週一 06:00 之前
+    if weekday == 0 and hhmmss < datetime.strptime("06:00:00", "%H:%M:%S").time():
+        return True
+
+    return False
+
+
+def _run_time_guard_selftest() -> None:
+    tz = ZoneInfo("Asia/Taipei")
+    cases = [
+        ("2026-03-12T04:59:59+08:00", False),  # Thu
+        ("2026-03-12T05:00:00+08:00", True),
+        ("2026-03-12T05:59:59+08:00", True),
+        ("2026-03-12T06:00:00+08:00", False),
+        ("2026-03-14T04:59:59+08:00", False),  # Sat
+        ("2026-03-14T05:00:00+08:00", True),
+        ("2026-03-15T12:00:00+08:00", True),  # Sun
+        ("2026-03-16T05:59:59+08:00", True),  # Mon
+        ("2026-03-16T06:00:00+08:00", False),
+    ]
+    for iso_s, expected in cases:
+        dt = datetime.fromisoformat(iso_s).astimezone(tz)
+        got = is_futures_market_closed_taipei(dt)
+        if got != expected:
+            raise AssertionError(f"time guard selftest failed: {iso_s} expected={expected} got={got}")
 
 
 def ensure_deps():
@@ -604,6 +662,16 @@ def append_trade_log_and_export_csv(record: Dict[str, Any]) -> Tuple[int, str, s
 
 
 def main() -> int:
+    if (os.getenv("TRADE_ANALYST_TIME_GUARD_SELFTEST") or "").strip() == "1":
+        _run_time_guard_selftest()
+        print("[info] Time guard selftest passed")
+        return 0
+
+    now_tpe = get_taipei_now((os.getenv("TRADE_ANALYST_NOW") or "").strip() or None)
+    if is_futures_market_closed_taipei(now_tpe):
+        print("[Info] 目前為期貨休市時間 (每日保養或週末)，暫停分析與交易。")
+        sys.exit(0)
+
     yf = ensure_deps()
     s = fetch_snapshot(yf)
 
