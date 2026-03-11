@@ -42,6 +42,11 @@ class Snapshot:
     rsi14: float
     macd: float
     macd_signal: float
+    candle_body: float
+    upper_wick_ratio: float
+    lower_wick_ratio: float
+    bias_ema20: float
+    bias_ema50: float
 
 
 @dataclass
@@ -54,6 +59,7 @@ class Plan:
     tp: float
     reason: str
     raw: str
+    new_skill_proposal: Optional[Dict[str, str]] = None
 
 
 def eprint(msg: str) -> None:
@@ -129,6 +135,17 @@ def fetch_snapshot(yf_module) -> Snapshot:
     df["MACD"] = macd[macd_col]
     df["MACD_SIGNAL"] = macd[macds_col]
 
+    price_range = (df["High"] - df["Low"]).astype(float)
+    safe_range = price_range.where(price_range != 0.0)
+    candle_top = df[["Open", "Close"]].max(axis=1)
+    candle_bottom = df[["Open", "Close"]].min(axis=1)
+
+    df["CANDLE_BODY"] = (df["Close"] - df["Open"]).abs().astype(float)
+    df["UPPER_WICK_RATIO"] = ((df["High"] - candle_top) / safe_range).fillna(0.0)
+    df["LOWER_WICK_RATIO"] = ((candle_bottom - df["Low"]) / safe_range).fillna(0.0)
+    df["BIAS_EMA20"] = ((df["Close"] - df["EMA20"]) / df["EMA20"].replace(0, float("nan")) * 100.0).fillna(0.0)
+    df["BIAS_EMA50"] = ((df["Close"] - df["EMA50"]) / df["EMA50"].replace(0, float("nan")) * 100.0).fillna(0.0)
+
     df = df.dropna().copy()
     if df.empty:
         eprint("[error] Not enough rows after indicators (dropna produced empty dataframe)")
@@ -144,6 +161,11 @@ def fetch_snapshot(yf_module) -> Snapshot:
         rsi14=float(latest["RSI14"]),
         macd=float(latest["MACD"]),
         macd_signal=float(latest["MACD_SIGNAL"]),
+        candle_body=float(latest["CANDLE_BODY"]),
+        upper_wick_ratio=float(latest["UPPER_WICK_RATIO"]),
+        lower_wick_ratio=float(latest["LOWER_WICK_RATIO"]),
+        bias_ema20=float(latest["BIAS_EMA20"]),
+        bias_ema50=float(latest["BIAS_EMA50"]),
     )
 
 
@@ -256,7 +278,9 @@ def trend_summary(s: Snapshot) -> str:
         trend = "空頭"
     return (
         f"{trend} | Close={s.close:.2f}, EMA20={s.ema20:.2f}, EMA50={s.ema50:.2f}, "
-        f"RSI14={s.rsi14:.2f}, MACD={s.macd:.3f}/{s.macd_signal:.3f}"
+        f"RSI14={s.rsi14:.2f}, MACD={s.macd:.3f}/{s.macd_signal:.3f}, "
+        f"Body={s.candle_body:.2f}, UpperWick={s.upper_wick_ratio:.3f}, LowerWick={s.lower_wick_ratio:.3f}, "
+        f"BiasEMA20={s.bias_ema20:.2f}%, BiasEMA50={s.bias_ema50:.2f}%"
     )
 
 
@@ -323,6 +347,7 @@ def rule_plan(s: Snapshot, winrate: float, history_summary: str) -> Plan:
             "sl": round(sl, 2),
             "tp": round(tp, 2),
             "reason": reason,
+            "new_skill_proposal": None,
         },
         ensure_ascii=False,
     )
@@ -344,8 +369,9 @@ def llm_plan(s: Snapshot, winrate: float, history_summary: str) -> Optional[Plan
     model = (os.getenv("OPENAI_MODEL") or "gpt-4o-mini").strip()
     sys_prompt = (
         "You are a futures trading strategist for YM=F 15m paper trading. "
-        "Output ONLY JSON with keys: sentiment_score, reflection_one_liner, action, entry, sl, tp, reason. "
-        "action must be LONG, SHORT, or HOLD. sentiment_score must be 0-100 integer."
+        "Output ONLY JSON with keys: sentiment_score, reflection_one_liner, action, entry, sl, tp, reason, new_skill_proposal. "
+        "action must be LONG, SHORT, or HOLD. sentiment_score must be 0-100 integer. "
+        "new_skill_proposal must be null or an object with skill_name and reason."
     )
 
     extra = ""
@@ -357,8 +383,12 @@ def llm_plan(s: Snapshot, winrate: float, history_summary: str) -> Optional[Plan
         f"歷史摘要：{history_summary}\n"
         f"{extra}\n"
         "當下決策：根據最新K線與指標，結合歷史教訓，給 direction/entry/sl/tp/action。\n"
-        f"最新資料: ts={s.ts}, close={s.close}, EMA20={s.ema20}, EMA50={s.ema50}, "
-        f"RSI14={s.rsi14}, MACD={s.macd}, MACD_SIGNAL={s.macd_signal}"
+        "你不必拘泥於傳統指標。你可以觀察這些基礎特徵的組合。如果發現特殊的 K 線型態勝率更高，你可以直接定義這個新形態作為進場理由。\n"
+        f"當下盤勢輸入: ts={s.ts}, close={s.close}, EMA20={s.ema20}, EMA50={s.ema50}, "
+        f"RSI14={s.rsi14}, MACD={s.macd}, MACD_SIGNAL={s.macd_signal}, "
+        f"candle_body={s.candle_body}, upper_wick_ratio={s.upper_wick_ratio}, lower_wick_ratio={s.lower_wick_ratio}, "
+        f"bias_ema20={s.bias_ema20}, bias_ema50={s.bias_ema50}\n"
+        "為了達成月獲利 1000 點的 KPI，如果你發現當前的數據來源（只有 K 線）不足以提高勝率（例如你需要 VIX 恐慌指數，或新聞情緒），你可以提出開發新 Skill 的需求。"
     )
 
     payload = {
@@ -397,7 +427,15 @@ def llm_plan(s: Snapshot, winrate: float, history_summary: str) -> Optional[Plan
         reflection = str(parsed.get("reflection_one_liner", ""))[:220] or "N/A"
         reason = str(parsed.get("reason", ""))[:800] or "N/A"
 
-        return Plan(sentiment, reflection, action, entry, sl, tp, reason, text)
+        proposal = None
+        raw_proposal = parsed.get("new_skill_proposal")
+        if isinstance(raw_proposal, dict):
+            skill_name = str(raw_proposal.get("skill_name", "")).strip()
+            proposal_reason = str(raw_proposal.get("reason", "")).strip()
+            if skill_name and proposal_reason:
+                proposal = {"skill_name": skill_name[:80], "reason": proposal_reason[:300]}
+
+        return Plan(sentiment, reflection, action, entry, sl, tp, reason, text, proposal)
     except Exception as exc:
         eprint(f"[warn] OpenAI planning failed ({exc}); fallback to rule engine")
         return None
@@ -439,12 +477,21 @@ def maybe_open_trade(conn: sqlite3.Connection, p: Plan) -> bool:
 
 
 def telegram_summary(winrate: float, reflection: str, trend: str, p: Plan) -> str:
-    return (
+    msg = (
         "📊 道瓊期貨 AI 交易員 (15m)\n"
         f"🧠 自我檢討：{winrate:.1f}% - {reflection}\n"
         f"📈 當前盤勢：{trend}\n"
         f"🤖 最新計畫：{p.action} (Entry: {p.entry:.2f}, SL: {p.sl:.2f}, TP: {p.tp:.2f})"
     )
+    if p.new_skill_proposal:
+        skill_name = p.new_skill_proposal.get("skill_name", "(unknown)")
+        reason = p.new_skill_proposal.get("reason", "(no reason)")
+        msg += (
+            "\n"
+            f"💡 [AI 研發提案]：我需要擴充新能力 - {skill_name}。"
+            f"理由：{reason}。請建友協助開發或授權。"
+        )
+    return msg
 
 
 def send_telegram(msg: str) -> str:
@@ -585,17 +632,25 @@ def main() -> int:
         "analysis_reasoning": str(plan.reason),
         "error_review": str(plan.reflection_one_liner),
         "optimization_suggestion": "依近期勝率動態調整進場過濾條件與停損帶寬。",
+        "new_skill_proposal": plan.new_skill_proposal,
         "prior_trade_status": prior_trade_status,
     }
     log_count, json_path, csv_path = append_trade_log_and_export_csv(log_record)
 
     print(f"[info] Symbol={SYMBOL} interval={INTERVAL} ts={s.ts}")
-    print(f"[info] Indicators: Close={s.close:.2f} EMA20={s.ema20:.2f} EMA50={s.ema50:.2f} RSI14={s.rsi14:.2f} MACD={s.macd:.3f}/{s.macd_signal:.3f}")
+    print(
+        "[info] Indicators: "
+        f"Close={s.close:.2f} EMA20={s.ema20:.2f} EMA50={s.ema50:.2f} RSI14={s.rsi14:.2f} "
+        f"MACD={s.macd:.3f}/{s.macd_signal:.3f} Body={s.candle_body:.2f} "
+        f"UpperWick={s.upper_wick_ratio:.3f} LowerWick={s.lower_wick_ratio:.3f} "
+        f"BiasEMA20={s.bias_ema20:.2f}% BiasEMA50={s.bias_ema50:.2f}%"
+    )
     print(f"[info] Reflection winrate(last5)={winrate:.1f}%")
     print(
         f"[info] Plan: sentiment_score={plan.sentiment_score} action={plan.action} "
         f"entry={plan.entry:.2f} sl={plan.sl:.2f} tp={plan.tp:.2f}"
     )
+    print(f"[info] new_skill_proposal={json.dumps(plan.new_skill_proposal, ensure_ascii=False)}")
     print(f"[info] Trades: settled_open={closed}, opened_new={opened}")
     print(f"[info] Log export: records={log_count} json={json_path} csv={csv_path}")
     print(f"[info] Telegram: {tg_state}")
