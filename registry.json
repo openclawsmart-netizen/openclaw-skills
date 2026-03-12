@@ -24,11 +24,11 @@
     "command": "python3 scripts/trade_analyst.py"
   },
   "ai-orchestrator": {
-    "description": "Orchestrate YM=F 15m analysis with Gemini strategy + Groq risk check and send Telegram summary",
+    "description": "[DEPRECATED] Use trade-analyst instead (legacy shim only)",
     "command": "python3 scripts/ai_orchestrator.py"
   },
   "report-generator": {
-    "description": "Generate Excel report from logs/syndicate JSON files",
+    "description": "Generate Excel report from data/trade_logs.json",
     "command": "python3 scripts/json_to_excel.py"
   }
 }

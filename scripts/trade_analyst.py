@@ -1,12 +1,17 @@
 #!/usr/bin/env python3
-"""YM=F 15m trade analyst skill.
+"""YM=F 15m trade analyst skill (single quant entrypoint).
 
-- Downloads recent 15m candles via yfinance (period=5d)
-- Computes EMA20/EMA50/RSI14/MACD(12,26,9) via pandas_ta
-- Settles/open paper trades in SQLite: data/trading_v1.db
-- Builds self-reflection from latest 5 closed trades
-- Generates plan with LLM (if OPENAI_API_KEY exists) or rule fallback
-- Sends Telegram summary via proactive-agent/send_telegram.py (graceful skip)
+Architecture (tri-brain):
+1) Time Guard (TW maintenance + weekend + US holiday) => hit then exit(0)
+2) Groq risk check => normalized risk_level / volatility_flag
+3) Gemini strategy => action/entry/sl/tp/reason/new_skill_proposal
+4) OpenAI arbitration => final risk review + JSON normalization
+   - No OPENAI key => deterministic fallback with same output schema
+
+Unified persistence:
+- SQLite: data/trading_v1.db (trades)
+- JSON:   data/trade_logs.json (append valid JSON array)
+- CSV:    data/trade_logs.csv (utf-8-sig)
 """
 
 from __future__ import annotations
@@ -18,9 +23,9 @@ import subprocess
 import sys
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from zoneinfo import ZoneInfo
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+from zoneinfo import ZoneInfo
 
 SYMBOL = "YM=F"
 INTERVAL = "15m"
@@ -32,6 +37,10 @@ DB_PATH = DATA_DIR / "trading_v1.db"
 TRADE_LOG_JSON = DATA_DIR / "trade_logs.json"
 TRADE_LOG_CSV = DATA_DIR / "trade_logs.csv"
 TELEGRAM_SCRIPT = BASE_DIR / "proactive-agent" / "send_telegram.py"
+
+GROQ_MODEL = (os.getenv("GROQ_MODEL") or "llama-3.1-8b-instant").strip()
+GEMINI_MODEL = (os.getenv("GEMINI_MODEL") or "gemini-2.0-flash").strip()
+OPENAI_MODEL = (os.getenv("OPENAI_MODEL") or "gpt-4o-mini").strip()
 
 
 @dataclass
@@ -71,6 +80,40 @@ def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def safe_float(v: Any, default: float) -> float:
+    try:
+        return float(v)
+    except Exception:
+        return default
+
+
+def clamp(v: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, v))
+
+
+def extract_json_object(text: str) -> Dict[str, Any]:
+    text = (text or "").strip()
+    if not text:
+        return {}
+    try:
+        loaded = json.loads(text)
+        if isinstance(loaded, dict):
+            return loaded
+    except Exception:
+        pass
+
+    start = text.find("{")
+    end = text.rfind("}")
+    if start >= 0 and end > start:
+        try:
+            loaded = json.loads(text[start : end + 1])
+            if isinstance(loaded, dict):
+                return loaded
+        except Exception:
+            pass
+    return {}
+
+
 def get_taipei_now(override_iso: Optional[str] = None) -> datetime:
     tz = ZoneInfo("Asia/Taipei")
     if override_iso:
@@ -90,26 +133,15 @@ def is_futures_market_closed_taipei(now_tpe: datetime) -> bool:
     weekday = now_tpe.weekday()  # Mon=0 ... Sun=6
     hhmmss = now_tpe.time()
 
-    # 每日保養時段：05:00:00 ~ 05:59:59
-    if 5 <= now_tpe.hour < 6:
+    if 5 <= now_tpe.hour < 6:  # 每日保養
         return True
-
-    # 週末休市：
-    # a) 週六 05:00 之後
-    if weekday == 5 and hhmmss >= datetime.strptime("05:00:00", "%H:%M:%S").time():
+    if weekday == 5 and hhmmss >= datetime.strptime("05:00:00", "%H:%M:%S").time():  # 週六 05:00 後
         return True
-    # b) 整個週日
-    if weekday == 6:
+    if weekday == 6:  # 週日
         return True
-    # c) 週一 06:00 之前
-    if weekday == 0 and hhmmss < datetime.strptime("06:00:00", "%H:%M:%S").time():
+    if weekday == 0 and hhmmss < datetime.strptime("06:00:00", "%H:%M:%S").time():  # 週一 06:00 前
         return True
-
     return False
-
-
-
-
 
 
 def get_us_eastern_zone() -> Optional[ZoneInfo]:
@@ -120,6 +152,8 @@ def get_us_eastern_zone() -> Optional[ZoneInfo]:
             continue
     eprint("[warn] 無法載入 US/Eastern 時區資料，將略過美國國定假日檢查並繼續執行。")
     return None
+
+
 def ensure_holidays_module():
     try:
         import holidays  # type: ignore
@@ -137,13 +171,11 @@ def ensure_holidays_module():
         )
     except Exception as exc:
         eprint(f"[warn] Failed to run pip3 install holidays: {exc}")
-        eprint("[warn] 無法啟用美國國定假日檢查，將略過此檢查並繼續執行。")
         return None
 
     if proc.returncode != 0:
         err = (proc.stderr or proc.stdout or "").strip()
         eprint(f"[warn] pip3 install holidays failed (rc={proc.returncode}): {err}")
-        eprint("[warn] 無法啟用美國國定假日檢查，將略過此檢查並繼續執行。")
         return None
 
     try:
@@ -191,24 +223,22 @@ def _run_holiday_guard_selftest() -> None:
     fake_holidays = {
         now_tpe.astimezone(ZoneInfo("America/New_York")).date(): "Independence Day (observed)"
     }
-    holiday_name = get_us_holiday_name_from_taipei(
-        now_tpe=now_tpe,
-        holidays_module=None,
-        holidays_calendar=fake_holidays,
-    )
+    holiday_name = get_us_holiday_name_from_taipei(now_tpe=now_tpe, holidays_module=None, holidays_calendar=fake_holidays)
     if holiday_name != "Independence Day (observed)":
         raise AssertionError(f"holiday guard selftest failed: got={holiday_name}")
+
+
 def _run_time_guard_selftest() -> None:
     tz = ZoneInfo("Asia/Taipei")
     cases = [
-        ("2026-03-12T04:59:59+08:00", False),  # Thu
+        ("2026-03-12T04:59:59+08:00", False),
         ("2026-03-12T05:00:00+08:00", True),
         ("2026-03-12T05:59:59+08:00", True),
         ("2026-03-12T06:00:00+08:00", False),
-        ("2026-03-14T04:59:59+08:00", False),  # Sat
+        ("2026-03-14T04:59:59+08:00", False),
         ("2026-03-14T05:00:00+08:00", True),
-        ("2026-03-15T12:00:00+08:00", True),  # Sun
-        ("2026-03-16T05:59:59+08:00", True),  # Mon
+        ("2026-03-15T12:00:00+08:00", True),
+        ("2026-03-16T05:59:59+08:00", True),
         ("2026-03-16T06:00:00+08:00", False),
     ]
     for iso_s, expected in cases:
@@ -288,6 +318,7 @@ def fetch_snapshot(yf_module) -> Snapshot:
     candle_top = df[["Open", "Close"]].max(axis=1)
     candle_bottom = df[["Open", "Close"]].min(axis=1)
 
+    # 必須保留的微觀特徵
     df["CANDLE_BODY"] = (df["Close"] - df["Open"]).abs().astype(float)
     df["UPPER_WICK_RATIO"] = ((df["High"] - candle_top) / safe_range).fillna(0.0)
     df["LOWER_WICK_RATIO"] = ((candle_bottom - df["Low"]) / safe_range).fillna(0.0)
@@ -296,7 +327,7 @@ def fetch_snapshot(yf_module) -> Snapshot:
 
     df = df.dropna().copy()
     if df.empty:
-        eprint("[error] Not enough rows after indicators (dropna produced empty dataframe)")
+        eprint("[error] Not enough rows after indicators")
         sys.exit(5)
 
     latest = df.iloc[-1]
@@ -342,9 +373,7 @@ def ensure_db(conn: sqlite3.Connection) -> None:
 
 
 def settle_open_trades(conn: sqlite3.Connection, price: float) -> int:
-    rows = conn.execute(
-        "SELECT id, side, entry_price, sl, tp FROM trades WHERE status='OPEN'"
-    ).fetchall()
+    rows = conn.execute("SELECT id, side, entry_price, sl, tp FROM trades WHERE status='OPEN'").fetchall()
     closed = 0
 
     for trade_id, side, entry, sl, tp in rows:
@@ -411,10 +440,7 @@ def get_reflection(conn: sqlite3.Connection) -> Tuple[float, List[str], str]:
         status_s = str(status or "").upper()
         items.append(f"- {status_s} | PnL={pnl_v:.2f} | reason={reason_s}")
 
-    summary = (
-        f"Last {total} closed trades winrate={winrate:.1f}%. "
-        + " ".join([f"[{i}]" for i in items])
-    )
+    summary = f"Last {total} closed trades winrate={winrate:.1f}%. " + " ".join([f"[{i}]" for i in items])
     return winrate, items, summary
 
 
@@ -432,118 +458,278 @@ def trend_summary(s: Snapshot) -> str:
     )
 
 
-def safe_float(v: Any, default: float) -> float:
-    try:
-        return float(v)
-    except Exception:
-        return default
-
-
-def clamp(v: float, lo: float, hi: float) -> float:
-    return max(lo, min(hi, v))
-
-
-def rule_plan(s: Snapshot, winrate: float, history_summary: str) -> Plan:
-    score = 50
-    if s.close > s.ema20 > s.ema50:
-        score += 18
-    elif s.close < s.ema20 < s.ema50:
-        score -= 18
-
-    if s.rsi14 < 30:
-        score += 10
-    elif s.rsi14 > 70:
-        score -= 10
-
-    if s.macd > s.macd_signal:
-        score += 7
-    else:
-        score -= 7
-
-    score = int(clamp(score, 0, 100))
-
-    action = "HOLD"
-    if score >= 60:
-        action = "LONG"
-    elif score <= 40:
-        action = "SHORT"
-
-    entry = s.close
-    band = max(s.close * 0.002, 25.0)
-    if action == "LONG":
-        sl = entry - band
-        tp = entry + band * 1.6
-    elif action == "SHORT":
-        sl = entry + band
-        tp = entry - band * 1.6
-    else:
-        sl = entry - band
-        tp = entry + band
-
-    refl = "依規則引擎：延續優勢訊號"
-    if winrate < 50:
-        refl = "近期勝率偏低，已收斂風險並修正進場條件"
-
-    reason = f"Fallback engine based on EMA/RSI/MACD. history={history_summary}"
-    raw = json.dumps(
-        {
-            "source": "rule_engine",
-            "sentiment_score": score,
-            "reflection_one_liner": refl,
-            "action": action,
-            "entry": round(entry, 2),
-            "sl": round(sl, 2),
-            "tp": round(tp, 2),
-            "reason": reason,
-            "new_skill_proposal": None,
-        },
-        ensure_ascii=False,
-    )
-
-    return Plan(score, refl, action, round(entry, 2), round(sl, 2), round(tp, 2), reason, raw)
-
-
-def llm_plan(s: Snapshot, winrate: float, history_summary: str) -> Optional[Plan]:
-    api_key = (os.getenv("OPENAI_API_KEY") or "").strip()
-    if not api_key:
-        return None
-
+def _get_requests_module():
     try:
         import requests  # type: ignore
+
+        return requests
     except ImportError:
-        eprint("[warn] OPENAI_API_KEY is set but requests is missing; fallback to rule engine")
         return None
 
-    model = (os.getenv("OPENAI_MODEL") or "gpt-4o-mini").strip()
-    sys_prompt = (
-        "You are a futures trading strategist for YM=F 15m paper trading. "
-        "Output ONLY JSON with keys: sentiment_score, reflection_one_liner, action, entry, sl, tp, reason, new_skill_proposal. "
-        "action must be LONG, SHORT, or HOLD. sentiment_score must be 0-100 integer. "
-        "new_skill_proposal must be null or an object with skill_name and reason."
+
+def normalize_risk(parsed: Dict[str, Any], s: Snapshot, degraded: bool = False) -> Dict[str, Any]:
+    fallback_score = 5 + (1 if abs(s.bias_ema20) > 0.8 else 0) + (1 if abs(s.bias_ema50) > 1.2 else 0)
+    risk_level = int(clamp(round(safe_float(parsed.get("risk_level"), fallback_score)), 0, 10))
+
+    vol_raw = parsed.get("volatility_flag", "normal")
+    vol = "normal"
+    if isinstance(vol_raw, bool):
+        vol = "high" if vol_raw else "normal"
+    elif isinstance(vol_raw, str):
+        v = vol_raw.strip().lower()
+        if v in {"high", "true", "1"}:
+            vol = "high"
+        elif v in {"normal", "false", "0", "low"}:
+            vol = "normal"
+        else:
+            degraded = True
+    else:
+        degraded = True
+
+    return {
+        "risk_level": risk_level,
+        "volatility_flag": vol,
+        "degraded": degraded,
+    }
+
+
+def step1_groq_risk_check(s: Snapshot) -> Dict[str, Any]:
+    key = (os.getenv("GROQ_API_KEY") or "").strip()
+    requests = _get_requests_module()
+
+    fallback = {
+        "risk_level": int(clamp(round(4 + abs(s.bias_ema20) * 0.6 + abs(s.bias_ema50) * 0.4), 0, 10)),
+        "volatility_flag": "high" if abs(s.bias_ema20) > 1.2 or abs(s.bias_ema50) > 1.5 else "normal",
+        "risk_notes": ["fallback_risk_model"],
+    }
+
+    if not key or requests is None:
+        reason = "missing GROQ_API_KEY" if not key else "missing requests dependency"
+        return {"status": "fallback", "reason": reason, "raw_json": fallback, "normalized": normalize_risk(fallback, s, True)}
+
+    prompt = (
+        "You are a futures risk sentinel. Output strict JSON only. "
+        "Required keys: risk_level(0-10 int), volatility_flag(high/normal). "
+        "Optional: risk_notes(array).\n"
+        f"Snapshot: {json.dumps(s.__dict__, ensure_ascii=False)}"
     )
-
-    extra = ""
-    if winrate < 50:
-        extra = "必須輸出：失敗檢討與策略修正，並放在 reflection_one_liner/reason 內。"
-
-    user_prompt = (
-        f"歷史反思：最近5筆勝率 {winrate:.1f}%\n"
-        f"歷史摘要：{history_summary}\n"
-        f"{extra}\n"
-        "當下決策：根據最新K線與指標，結合歷史教訓，給 direction/entry/sl/tp/action。\n"
-        "你不必拘泥於傳統指標。你可以觀察這些基礎特徵的組合。如果發現特殊的 K 線型態勝率更高，你可以直接定義這個新形態作為進場理由。\n"
-        f"當下盤勢輸入: ts={s.ts}, close={s.close}, EMA20={s.ema20}, EMA50={s.ema50}, "
-        f"RSI14={s.rsi14}, MACD={s.macd}, MACD_SIGNAL={s.macd_signal}, "
-        f"candle_body={s.candle_body}, upper_wick_ratio={s.upper_wick_ratio}, lower_wick_ratio={s.lower_wick_ratio}, "
-        f"bias_ema20={s.bias_ema20}, bias_ema50={s.bias_ema50}\n"
-        "為了達成月獲利 1000 點的 KPI，如果你發現當前的數據來源（只有 K 線）不足以提高勝率（例如你需要 VIX 恐慌指數，或新聞情緒），你可以提出開發新 Skill 的需求。"
-    )
-
     payload = {
-        "model": model,
-        "temperature": 0.2,
+        "model": GROQ_MODEL,
+        "temperature": 0.1,
         "messages": [
-            {"role": "system", "content": sys_prompt},
+            {"role": "system", "content": "Strict JSON output only."},
+            {"role": "user", "content": prompt},
+        ],
+        "response_format": {"type": "json_object"},
+    }
+
+    try:
+        resp = requests.post(
+            "https://api.groq.com/openai/v1/chat/completions",
+            headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+            json=payload,
+            timeout=20,
+        )
+        if resp.status_code != 200:
+            return {
+                "status": "fallback",
+                "reason": f"Groq HTTP {resp.status_code}",
+                "raw_json": fallback,
+                "normalized": normalize_risk(fallback, s, True),
+            }
+        text = resp.json().get("choices", [{}])[0].get("message", {}).get("content", "")
+        parsed = extract_json_object(text)
+        if not parsed:
+            parsed = fallback
+            return {"status": "degraded", "reason": "non-json response", "raw_json": parsed, "normalized": normalize_risk(parsed, s, True)}
+        return {"status": "ok", "reason": "", "raw_json": parsed, "normalized": normalize_risk(parsed, s, False)}
+    except Exception as exc:
+        return {"status": "fallback", "reason": f"Groq exception: {exc}", "raw_json": fallback, "normalized": normalize_risk(fallback, s, True)}
+
+
+def step2_gemini_strategy(s: Snapshot, winrate: float, history_summary: str, groq_norm: Dict[str, Any]) -> Dict[str, Any]:
+    key = (os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY") or "").strip()
+    requests = _get_requests_module()
+
+    risk_level = int(groq_norm.get("risk_level", 5))
+    vol_flag = str(groq_norm.get("volatility_flag", "normal"))
+
+    def fallback(reason: str) -> Dict[str, Any]:
+        score = 50
+        if s.close > s.ema20 > s.ema50:
+            score += 15
+        elif s.close < s.ema20 < s.ema50:
+            score -= 15
+        score += 8 if s.macd > s.macd_signal else -8
+        if s.rsi14 > 70:
+            score -= 8
+        elif s.rsi14 < 30:
+            score += 8
+        if risk_level >= 7:
+            score = max(35, min(65, score))
+
+        action = "HOLD"
+        if score >= 60 and risk_level <= 8:
+            action = "LONG"
+        elif score <= 40 and risk_level <= 8:
+            action = "SHORT"
+
+        band = max(s.close * 0.002, 25.0)
+        if action == "LONG":
+            sl, tp = s.close - band, s.close + band * 1.6
+        elif action == "SHORT":
+            sl, tp = s.close + band, s.close - band * 1.6
+        else:
+            sl, tp = s.close - band, s.close + band
+
+        proposal = None
+        if winrate < 45:
+            proposal = {
+                "skill_name": "market-context-sensor",
+                "reason": "近期勝率偏低，建議加入 VIX/新聞情緒作為濾網以降低假突破。",
+            }
+
+        payload = {
+            "sentiment_score": int(clamp(score, 0, 100)),
+            "reflection_one_liner": "Gemini fallback：已整合風險哨兵與微觀特徵進行保守決策。",
+            "action": action,
+            "entry": round(s.close, 2),
+            "sl": round(sl, 2),
+            "tp": round(tp, 2),
+            "reason": f"fallback_strategy(reason={reason}, risk_level={risk_level}, volatility={vol_flag}, history={history_summary})",
+            "new_skill_proposal": proposal,
+        }
+        return {"status": "fallback", "reason": reason, "raw_json": payload}
+
+    if not key or requests is None:
+        return fallback("missing GEMINI_API_KEY/GOOGLE_API_KEY" if not key else "missing requests dependency")
+
+    prompt = (
+        "你是 YM=F 15m 量化策略師。請只輸出 JSON。\n"
+        "必要欄位: sentiment_score(0-100 int), reflection_one_liner, action(LONG/SHORT/HOLD), entry, sl, tp, reason, new_skill_proposal(null或{skill_name,reason})。\n"
+        "你必須結合：K線+微觀特徵(candle_body/upper_wick_ratio/lower_wick_ratio/bias_ema20/bias_ema50)+Groq風險訊號。\n"
+        f"Groq normalized: {json.dumps(groq_norm, ensure_ascii=False)}\n"
+        f"winrate={winrate:.1f}, history={history_summary}\n"
+        f"snapshot={json.dumps(s.__dict__, ensure_ascii=False)}"
+    )
+
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
+    payload = {
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {"temperature": 0.15, "maxOutputTokens": 600},
+    }
+
+    try:
+        resp = requests.post(url, params={"key": key}, json=payload, timeout=25)
+        if resp.status_code != 200:
+            return fallback(f"Gemini HTTP {resp.status_code}")
+
+        text = (
+            resp.json().get("candidates", [{}])[0]
+            .get("content", {})
+            .get("parts", [{}])[0]
+            .get("text", "")
+        )
+        parsed = extract_json_object(text)
+        if not parsed:
+            return fallback("Gemini non-json response")
+
+        return {"status": "ok", "reason": "", "raw_json": parsed}
+    except Exception as exc:
+        return fallback(f"Gemini exception: {exc}")
+
+
+def normalize_plan_payload(payload: Dict[str, Any], s: Snapshot) -> Plan:
+    sentiment = int(clamp(round(safe_float(payload.get("sentiment_score"), 50)), 0, 100))
+    action = str(payload.get("action", "HOLD")).upper().strip()
+    if action not in {"LONG", "SHORT", "HOLD"}:
+        action = "HOLD"
+
+    entry = round(safe_float(payload.get("entry"), s.close), 2)
+    sl = round(safe_float(payload.get("sl"), s.close), 2)
+    tp = round(safe_float(payload.get("tp"), s.close), 2)
+
+    reflection = str(payload.get("reflection_one_liner", "N/A"))[:220]
+    reason = str(payload.get("reason", "N/A"))[:900]
+
+    proposal = None
+    raw = payload.get("new_skill_proposal")
+    if isinstance(raw, dict):
+        name = str(raw.get("skill_name", "")).strip()
+        rs = str(raw.get("reason", "")).strip()
+        if name and rs:
+            proposal = {"skill_name": name[:80], "reason": rs[:300]}
+
+    return Plan(
+        sentiment_score=sentiment,
+        reflection_one_liner=reflection,
+        action=action,
+        entry=entry,
+        sl=sl,
+        tp=tp,
+        reason=reason,
+        raw=json.dumps(payload, ensure_ascii=False),
+        new_skill_proposal=proposal,
+    )
+
+
+def step3_openai_arbitrate(s: Snapshot, groq_norm: Dict[str, Any], gemini_payload: Dict[str, Any]) -> Tuple[Plan, Dict[str, Any]]:
+    key = (os.getenv("OPENAI_API_KEY") or "").strip()
+    requests = _get_requests_module()
+
+    def fallback(reason: str) -> Tuple[Plan, Dict[str, Any]]:
+        p = normalize_plan_payload(gemini_payload, s)
+        risk_level = int(groq_norm.get("risk_level", 5))
+        vol = str(groq_norm.get("volatility_flag", "normal"))
+
+        # deterministic risk arbitration while preserving same output schema
+        if p.action == "LONG" and (risk_level >= 9 or vol == "high") and p.sentiment_score < 55:
+            p.action = "HOLD"
+        if p.action == "SHORT" and (risk_level >= 9 or vol == "high") and p.sentiment_score > 45:
+            p.action = "HOLD"
+
+        if p.action == "HOLD":
+            band = max(s.close * 0.0015, 20.0)
+            p.entry = round(s.close, 2)
+            p.sl = round(s.close - band, 2)
+            p.tp = round(s.close + band, 2)
+
+        p.reason = f"{p.reason} | openai_arbitration=fallback({reason})"
+        p.raw = json.dumps(
+            {
+                "sentiment_score": p.sentiment_score,
+                "reflection_one_liner": p.reflection_one_liner,
+                "action": p.action,
+                "entry": p.entry,
+                "sl": p.sl,
+                "tp": p.tp,
+                "reason": p.reason,
+                "new_skill_proposal": p.new_skill_proposal,
+                "arbitration": {"status": "fallback", "reason": reason},
+            },
+            ensure_ascii=False,
+        )
+        return p, {"status": "fallback", "reason": reason}
+
+    if not key or requests is None:
+        return fallback("missing OPENAI_API_KEY" if not key else "missing requests dependency")
+
+    system_prompt = (
+        "You are the final risk arbitrator. Return strict JSON with keys: "
+        "sentiment_score, reflection_one_liner, action, entry, sl, tp, reason, new_skill_proposal. "
+        "Keep schema stable."
+    )
+    user_prompt = (
+        f"Groq normalized risk: {json.dumps(groq_norm, ensure_ascii=False)}\n"
+        f"Gemini candidate decision: {json.dumps(gemini_payload, ensure_ascii=False)}\n"
+        f"Snapshot: {json.dumps(s.__dict__, ensure_ascii=False)}\n"
+        "請做最終風險審核與 JSON 標準化，輸出單一 JSON。"
+    )
+    payload = {
+        "model": OPENAI_MODEL,
+        "temperature": 0.1,
+        "messages": [
+            {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
         ],
         "response_format": {"type": "json_object"},
@@ -552,41 +738,23 @@ def llm_plan(s: Snapshot, winrate: float, history_summary: str) -> Optional[Plan
     try:
         resp = requests.post(
             "https://api.openai.com/v1/chat/completions",
-            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+            headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
             json=payload,
             timeout=30,
         )
         if resp.status_code != 200:
-            eprint(f"[warn] OpenAI HTTP {resp.status_code}; fallback to rule engine")
-            return None
+            return fallback(f"OpenAI HTTP {resp.status_code}")
 
-        body = resp.json()
-        text = body["choices"][0]["message"]["content"]
-        parsed = json.loads(text)
+        text = resp.json().get("choices", [{}])[0].get("message", {}).get("content", "")
+        parsed = extract_json_object(text)
+        if not parsed:
+            return fallback("OpenAI non-json response")
 
-        sentiment = int(clamp(safe_float(parsed.get("sentiment_score"), 50), 0, 100))
-        action = str(parsed.get("action", "HOLD")).upper().strip()
-        if action not in {"LONG", "SHORT", "HOLD"}:
-            action = "HOLD"
-
-        entry = round(safe_float(parsed.get("entry"), s.close), 2)
-        sl = round(safe_float(parsed.get("sl"), s.close), 2)
-        tp = round(safe_float(parsed.get("tp"), s.close), 2)
-        reflection = str(parsed.get("reflection_one_liner", ""))[:220] or "N/A"
-        reason = str(parsed.get("reason", ""))[:800] or "N/A"
-
-        proposal = None
-        raw_proposal = parsed.get("new_skill_proposal")
-        if isinstance(raw_proposal, dict):
-            skill_name = str(raw_proposal.get("skill_name", "")).strip()
-            proposal_reason = str(raw_proposal.get("reason", "")).strip()
-            if skill_name and proposal_reason:
-                proposal = {"skill_name": skill_name[:80], "reason": proposal_reason[:300]}
-
-        return Plan(sentiment, reflection, action, entry, sl, tp, reason, text, proposal)
+        plan = normalize_plan_payload(parsed, s)
+        plan.raw = text
+        return plan, {"status": "ok", "reason": ""}
     except Exception as exc:
-        eprint(f"[warn] OpenAI planning failed ({exc}); fallback to rule engine")
-        return None
+        return fallback(f"OpenAI exception: {exc}")
 
 
 def has_open_trade(conn: sqlite3.Connection) -> bool:
@@ -597,7 +765,6 @@ def has_open_trade(conn: sqlite3.Connection) -> bool:
 def maybe_open_trade(conn: sqlite3.Connection, p: Plan) -> bool:
     if has_open_trade(conn):
         return False
-
     if p.action not in {"LONG", "SHORT"}:
         return False
 
@@ -608,17 +775,7 @@ def maybe_open_trade(conn: sqlite3.Connection, p: Plan) -> bool:
             ai_reflection, ai_plan_raw
         ) VALUES (?, ?, ?, ?, ?, ?, ?, 'OPEN', ?, ?)
         """,
-        (
-            SYMBOL,
-            now_iso(),
-            p.action,
-            p.entry,
-            p.sl,
-            p.tp,
-            p.reason,
-            p.reflection_one_liner,
-            p.raw,
-        ),
+        (SYMBOL, now_iso(), p.action, p.entry, p.sl, p.tp, p.reason, p.reflection_one_liner, p.raw),
     )
     conn.commit()
     return True
@@ -632,12 +789,10 @@ def telegram_summary(winrate: float, reflection: str, trend: str, p: Plan) -> st
         f"🤖 最新計畫：{p.action} (Entry: {p.entry:.2f}, SL: {p.sl:.2f}, TP: {p.tp:.2f})"
     )
     if p.new_skill_proposal:
-        skill_name = p.new_skill_proposal.get("skill_name", "(unknown)")
-        reason = p.new_skill_proposal.get("reason", "(no reason)")
         msg += (
-            "\n"
-            f"💡 [AI 研發提案]：我需要擴充新能力 - {skill_name}。"
-            f"理由：{reason}。請建友協助開發或授權。"
+            "\n🧪 [研發提案]\n"
+            f"- Skill: {p.new_skill_proposal.get('skill_name', '(unknown)')}\n"
+            f"- 理由: {p.new_skill_proposal.get('reason', '(no reason)')}"
         )
     return msg
 
@@ -762,6 +917,7 @@ def main() -> int:
         print("[info] Holiday guard selftest passed")
         return 0
 
+    # --- Time Guard must stay at the very front ---
     now_tpe = get_taipei_now((os.getenv("TRADE_ANALYST_NOW") or "").strip() or None)
     if is_futures_market_closed_taipei(now_tpe):
         print("[Info] 目前為期貨休市時間 (每日保養或週末)，暫停分析與交易。")
@@ -782,7 +938,12 @@ def main() -> int:
         ensure_db(conn)
         closed = settle_open_trades(conn, s.close)
         winrate, _, history_summary = get_reflection(conn)
-        plan = llm_plan(s, winrate, history_summary) or rule_plan(s, winrate, history_summary)
+
+        # Tri-brain orchestration
+        groq_result = step1_groq_risk_check(s)
+        gemini_result = step2_gemini_strategy(s, winrate, history_summary, groq_result.get("normalized", {}))
+        plan, openai_result = step3_openai_arbitrate(s, groq_result.get("normalized", {}), gemini_result.get("raw_json", {}))
+
         prior_trade_status = get_prior_trade_status(conn, s.close)
         opened = maybe_open_trade(conn, plan)
     finally:
@@ -803,6 +964,11 @@ def main() -> int:
         "optimization_suggestion": "依近期勝率動態調整進場過濾條件與停損帶寬。",
         "new_skill_proposal": plan.new_skill_proposal,
         "prior_trade_status": prior_trade_status,
+        "tri_brain_status": {
+            "groq": {"status": groq_result.get("status"), "reason": groq_result.get("reason"), "normalized": groq_result.get("normalized")},
+            "gemini": {"status": gemini_result.get("status"), "reason": gemini_result.get("reason")},
+            "openai": {"status": openai_result.get("status"), "reason": openai_result.get("reason")},
+        },
     }
     log_count, json_path, csv_path = append_trade_log_and_export_csv(log_record)
 
@@ -815,10 +981,8 @@ def main() -> int:
         f"BiasEMA20={s.bias_ema20:.2f}% BiasEMA50={s.bias_ema50:.2f}%"
     )
     print(f"[info] Reflection winrate(last5)={winrate:.1f}%")
-    print(
-        f"[info] Plan: sentiment_score={plan.sentiment_score} action={plan.action} "
-        f"entry={plan.entry:.2f} sl={plan.sl:.2f} tp={plan.tp:.2f}"
-    )
+    print(f"[info] Groq risk: {json.dumps(groq_result.get('normalized', {}), ensure_ascii=False)}")
+    print(f"[info] Plan: sentiment_score={plan.sentiment_score} action={plan.action} entry={plan.entry:.2f} sl={plan.sl:.2f} tp={plan.tp:.2f}")
     print(f"[info] new_skill_proposal={json.dumps(plan.new_skill_proposal, ensure_ascii=False)}")
     print(f"[info] Trades: settled_open={closed}, opened_new={opened}")
     print(f"[info] Log export: records={log_count} json={json_path} csv={csv_path}")
