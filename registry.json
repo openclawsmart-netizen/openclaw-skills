@@ -34,5 +34,9 @@
   "backtest-engine": {
     "description": "Run lightweight local-rule backtest over yfinance CSV/history",
     "command": "python3 scripts/backtest_engine.py"
+  },
+  "trade-health-check": {
+    "description": "Check latest trade log health status and optionally notify Telegram",
+    "command": "python3 scripts/trade_health_check.py"
   }
 }

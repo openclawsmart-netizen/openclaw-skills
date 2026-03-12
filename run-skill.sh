@@ -26,6 +26,10 @@ load_env_file "/root/.openclaw_env"
 skill="${1:-}"
 if [[ -z "$skill" ]]; then
   echo "Usage: $0 <skill-name> [args...]" >&2
+  echo "Examples:" >&2
+  echo "  $0 health-check" >&2
+  echo "  $0 trade-analyst" >&2
+  echo "  $0 trade-health-check" >&2
   exit 2
 fi
 shift || true
