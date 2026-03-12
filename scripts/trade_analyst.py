@@ -22,6 +22,7 @@ import os
 import sqlite3
 import subprocess
 import sys
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -52,6 +53,10 @@ OPENAI_MODEL = (os.getenv("OPENAI_MODEL") or "gpt-4o-mini").strip()
 
 CIRCUIT_BREAKER_DAILY_LOSS_LIMIT = -150.0
 CIRCUIT_BREAKER_MAX_LOSS_STREAK = 3
+
+CONSULTANT_COMMANDER_TAG = "🚨 [諮詢-指揮官]：策略觸發警報，請將此報表 Excel 丟給指揮官 Gem 進行深度覆盤。"
+CONSULTANT_ENGINEER_TAG = "⚙️ [諮詢-工程師]：運算效能遇到瓶頸，請將需求丟給工程師 Gem 實作 OpenCL 優化。"
+CONSULTANT_SPECIALIST_TAG = "🏗 [諮詢-專員]：系統架構或環境異常，請將 Log 丟給專員 Gem 進行修復或架構升級。"
 
 
 @dataclass
@@ -596,6 +601,82 @@ def evaluate_circuit_breaker(cumulative_pnl: float, losing_streak: int) -> Optio
     if not reasons:
         return None
     return "；".join(reasons)
+
+
+def _contains_any(text: str, keywords: List[str]) -> bool:
+    lowered = (text or "").lower()
+    return any(k in lowered for k in keywords)
+
+
+def build_consultant_routing(
+    *,
+    risk_control: Dict[str, Any],
+    error_review: str,
+    tri_brain_status: Dict[str, Any],
+    new_skill_proposal: Optional[Dict[str, str]],
+    optimization_suggestion: str,
+    indicator_calc_seconds: float,
+) -> Tuple[List[str], List[str]]:
+    tags: List[str] = []
+    notes: List[str] = []
+
+    # A) 諮詢-指揮官（風控斷路器/連三虧/嚴重邏輯偏離）
+    if bool(risk_control.get("circuit_breaker_active")):
+        tags.append(CONSULTANT_COMMANDER_TAG)
+        notes.append("觸發原因：circuit_breaker_active=true")
+    if int(safe_float(risk_control.get("losing_streak"), 0)) >= 3:
+        if CONSULTANT_COMMANDER_TAG not in tags:
+            tags.append(CONSULTANT_COMMANDER_TAG)
+        notes.append("觸發原因：losing_streak >= 3")
+
+    severe_logic_keywords = [
+        "severe", "critical", "重大", "嚴重", "偏離", "錯誤", "hallucination", "inconsistent", "矛盾", "失真",
+    ]
+    if _contains_any(error_review, severe_logic_keywords):
+        if CONSULTANT_COMMANDER_TAG not in tags:
+            tags.append(CONSULTANT_COMMANDER_TAG)
+        notes.append("觸發原因：error_review 顯示策略邏輯嚴重偏離")
+
+    # B) 諮詢-工程師（複雜數學/大量資料/低延遲/指標計算 > 3 秒）
+    proposal_text = ""
+    if isinstance(new_skill_proposal, dict):
+        proposal_text = f"{new_skill_proposal.get('skill_name', '')} {new_skill_proposal.get('reason', '')}"
+    engineer_keywords = [
+        "complex", "math", "matrix", "regression", "optimization", "大量", "比對", "低延遲", "latency", "real-time",
+        "high frequency", "vector", "gpu", "opencl", "backtest", "million", "big data",
+    ]
+    if _contains_any(proposal_text, engineer_keywords):
+        tags.append(CONSULTANT_ENGINEER_TAG)
+        notes.append("觸發原因：new_skill_proposal 涉及複雜運算/資料量/低延遲需求")
+    if indicator_calc_seconds > 3.0:
+        if CONSULTANT_ENGINEER_TAG not in tags:
+            tags.append(CONSULTANT_ENGINEER_TAG)
+        notes.append(f"觸發原因：indicator_calc_seconds={indicator_calc_seconds:.3f} > 3.0")
+
+    # C) 諮詢-專員（路徑/API key/DB 寫入/系統環境/模擬轉實盤(IB)）
+    tri_text = json.dumps(tri_brain_status or {}, ensure_ascii=False)
+    specialist_keywords = [
+        "path", "not found", "api key", "missing", "db", "sqlite", "write failed", "permission", "env", "環境", "憑證", "失效",
+        "exception", "failed", "error", "timeout",
+    ]
+    migration_keywords = [
+        "ib", "interactive brokers", "paper", "live", "實盤", "模擬轉實盤", "gateway", "tws", "下單橋接", "execution adapter",
+    ]
+    if _contains_any(tri_text, specialist_keywords):
+        tags.append(CONSULTANT_SPECIALIST_TAG)
+        notes.append("觸發原因：檢測到 API/DB/環境錯誤訊號")
+
+    migration_hint = f"{proposal_text} {optimization_suggestion}"
+    if _contains_any(migration_hint, migration_keywords):
+        if CONSULTANT_SPECIALIST_TAG not in tags:
+            tags.append(CONSULTANT_SPECIALIST_TAG)
+        notes.append("觸發原因：檢測到模擬轉實盤(IB)架構調整需求")
+
+    unique_tags: List[str] = []
+    for tag in tags:
+        if tag not in unique_tags:
+            unique_tags.append(tag)
+    return unique_tags, notes
 
 
 def parse_args() -> argparse.Namespace:
@@ -1152,7 +1233,14 @@ def maybe_open_trade(conn: sqlite3.Connection, p: Plan, readonly_mode: bool = Fa
     return True
 
 
-def telegram_summary(winrate: float, reflection: str, trend: str, p: Plan, monthly: MonthlyProgress) -> str:
+def telegram_summary(
+    winrate: float,
+    reflection: str,
+    trend: str,
+    p: Plan,
+    monthly: MonthlyProgress,
+    consultant_tags: Optional[List[str]] = None,
+) -> str:
     msg = (
         "📊 道瓊期貨 AI 交易員 (15m)\n"
         f"🧠 自我檢討：{winrate:.1f}% - {reflection}\n"
@@ -1166,6 +1254,8 @@ def telegram_summary(winrate: float, reflection: str, trend: str, p: Plan, month
             f"- Skill: {p.new_skill_proposal.get('skill_name', '(unknown)')}\n"
             f"- 理由: {p.new_skill_proposal.get('reason', '(no reason)')}"
         )
+    if consultant_tags:
+        msg += "\n\n📌 Consultant Routing 建議：\n" + "\n".join(consultant_tags)
     return msg
 
 
@@ -1303,7 +1393,9 @@ def main() -> int:
         sys.exit(0)
 
     yf = ensure_deps()
+    indicator_t0 = time.perf_counter()
     s = fetch_snapshot(yf)
+    indicator_calc_seconds = time.perf_counter() - indicator_t0
 
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(DB_PATH)
@@ -1373,7 +1465,6 @@ def main() -> int:
         conn.close()
 
     trend = trend_summary(s)
-    tg_state = send_telegram(telegram_summary(winrate, plan.reflection_one_liner, trend, plan, monthly_progress))
 
     expected_profit_points = plan.tp - plan.entry if plan.action != "SELL" else plan.entry - plan.tp
     optimization_suggestion = str(gemini_result.get("raw_json", {}).get("optimization_suggestion", "")).strip()
@@ -1386,6 +1477,40 @@ def main() -> int:
             )
         else:
             optimization_suggestion = "依近期勝率動態調整進場過濾條件與停損帶寬。"
+
+    tri_brain_status = {
+        "groq": {"status": groq_result.get("status"), "reason": groq_result.get("reason"), "normalized": groq_result.get("normalized")},
+        "gemini": {"status": gemini_result.get("status"), "reason": gemini_result.get("reason")},
+        "openai": {"status": openai_result.get("status"), "reason": openai_result.get("reason")},
+    }
+    risk_control = {
+        "daily_pnl": daily_pnl,
+        "losing_streak": losing_streak,
+        "circuit_breaker_active": cb_state.get("active"),
+        "circuit_breaker_reason": cb_state.get("reason"),
+        "circuit_breaker_active_date": cb_state.get("active_date"),
+        "manual_reset_done": manual_reset_done,
+    }
+
+    consultant_tags, consultant_notes = build_consultant_routing(
+        risk_control=risk_control,
+        error_review=str(plan.reflection_one_liner),
+        tri_brain_status=tri_brain_status,
+        new_skill_proposal=plan.new_skill_proposal,
+        optimization_suggestion=optimization_suggestion,
+        indicator_calc_seconds=indicator_calc_seconds,
+    )
+
+    tg_state = send_telegram(
+        telegram_summary(
+            winrate,
+            plan.reflection_one_liner,
+            trend,
+            plan,
+            monthly_progress,
+            consultant_tags=consultant_tags,
+        )
+    )
 
     log_record: Dict[str, Any] = {
         "date": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -1404,14 +1529,7 @@ def main() -> int:
             "remaining": monthly_progress.remaining,
             "achievement_pct": monthly_progress.achievement_pct,
         },
-        "risk_control": {
-            "daily_pnl": daily_pnl,
-            "losing_streak": losing_streak,
-            "circuit_breaker_active": cb_state.get("active"),
-            "circuit_breaker_reason": cb_state.get("reason"),
-            "circuit_breaker_active_date": cb_state.get("active_date"),
-            "manual_reset_done": manual_reset_done,
-        },
+        "risk_control": risk_control,
         "strategy_mode": {
             "mode": mode_ctx.mode,
             "context": mode_ctx.context,
@@ -1420,11 +1538,10 @@ def main() -> int:
             "recent_stable": recent_stats.get("stable"),
             "force_goal_optimization": force_goal_optimization,
         },
-        "tri_brain_status": {
-            "groq": {"status": groq_result.get("status"), "reason": groq_result.get("reason"), "normalized": groq_result.get("normalized")},
-            "gemini": {"status": gemini_result.get("status"), "reason": gemini_result.get("reason")},
-            "openai": {"status": openai_result.get("status"), "reason": openai_result.get("reason")},
-        },
+        "tri_brain_status": tri_brain_status,
+        "consultant_tags": consultant_tags,
+        "consultant_notes": consultant_notes,
+        "indicator_calc_seconds": float(indicator_calc_seconds),
     }
     log_count, json_path, csv_path = append_trade_log_and_export_csv(log_record)
 
@@ -1447,6 +1564,8 @@ def main() -> int:
     print(f"[info] new_skill_proposal={json.dumps(plan.new_skill_proposal, ensure_ascii=False)}")
     print(f"[info] Risk: daily_pnl={daily_pnl:.2f} losing_streak={losing_streak} circuit_breaker_active={cb_state.get('active')} reason={cb_state.get('reason')}")
     print(f"[info] Trades: settled_open={closed}, opened_new={opened} readonly_mode={cb_state.get('active')}")
+    print(f"[info] Consultant routing: tags={json.dumps(consultant_tags, ensure_ascii=False)} notes={json.dumps(consultant_notes, ensure_ascii=False)}")
+    print(f"[info] Indicator calc seconds: {indicator_calc_seconds:.3f}")
     print(f"[info] Log export: records={log_count} json={json_path} csv={csv_path}")
     print(f"[info] Telegram: {tg_state}")
     return 0
