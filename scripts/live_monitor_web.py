@@ -14,9 +14,28 @@ from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
 BASE_DIR = Path(__file__).resolve().parent.parent
-DATA_DIR = BASE_DIR / "data"
 LOGS_DIR = BASE_DIR / "logs"
 REPORTS_DIR = BASE_DIR / "reports"
+
+DATA_DIR_CANDIDATES = [
+    BASE_DIR / "data",
+    BASE_DIR / "scripts" / "data",
+    BASE_DIR / "scripts" / "../data",
+    BASE_DIR / "../data",
+]
+
+
+def _resolve_data_dir() -> Path:
+    for cand in DATA_DIR_CANDIDATES:
+        p = cand.resolve()
+        if not p.exists() or not p.is_dir():
+            continue
+        if (p / "trade_logs.json").exists() or (p / "trade_logs.csv").exists() or (p / "trade_snapshot.json").exists():
+            return p
+    return (BASE_DIR / "data").resolve()
+
+
+DATA_DIR = _resolve_data_dir()
 
 TRADE_LOG_JSON = DATA_DIR / "trade_logs.json"
 CRON_LOG = LOGS_DIR / "cron_trade.log"
@@ -205,6 +224,18 @@ HTML_PAGE = """<!doctype html>
     </section>
 
     <section class="card">
+      <h2>健康分（Health Score）</h2>
+      <table class="kv" id="healthScore"></table>
+      <div class="small">四維度（4 factors）</div>
+      <ul id="healthFactors"></ul>
+    </section>
+
+    <section class="card">
+      <h2>任務透明度（Task Transparency）</h2>
+      <table class="kv" id="taskTransparency"></table>
+    </section>
+
+    <section class="card">
       <h2>交易摘要（Trade Snapshot）</h2>
       <table class="kv" id="tradeSnapshot"></table>
     </section>
@@ -257,6 +288,16 @@ HTML_PAGE = """<!doctype html>
       });
     }
 
+    function setHealthFactors(factors) {
+      const ul = document.getElementById('healthFactors');
+      ul.innerHTML = '';
+      Object.values(factors || {}).forEach((f) => {
+        const li = document.createElement('li');
+        li.textContent = `${f.zh || '-'} (${f.en || '-'})：-${f.penalty ?? 0} | ${f.detail || '-'}`;
+        ul.appendChild(li);
+      });
+    }
+
     async function runAction(path) {
       const msg = document.getElementById('actionMsg');
       msg.textContent = '執行中（Running）...';
@@ -302,6 +343,18 @@ HTML_PAGE = """<!doctype html>
         setList('scheduler', data?.scheduler || []);
 
         setTable('healthSummary', data?.health_summary || {});
+        setTable('healthScore', {
+          '健康分 Health Score': data?.health_score ?? MISSING,
+          '摘要 Summary': data?.health_summary_message ?? MISSING,
+          '資料路徑 Data Source': data?.data_source_path ?? MISSING,
+        });
+        setHealthFactors(data?.health_factors || {});
+        setTable('taskTransparency', {
+          '發生什麼事 What happened': data?.what_happened ?? MISSING,
+          '現在做什麼 What\'s the job': data?.whats_the_job ?? MISSING,
+          '進度 Progressing': data?.progressing ?? MISSING,
+          'AI 路由 AI routing': data?.ai_routing ?? MISSING,
+        });
         setTable('tradeSnapshot', data?.trade_snapshot || {});
         setTable('risk', data?.risk || {});
         setTable('modeRouting', data?.mode_routing || {});
@@ -469,6 +522,22 @@ def _collect_health(cron_tail: List[str]) -> Dict[str, Any]:
     }
 
 
+def _count_recent_matches(lines: List[str], keywords: Tuple[str, ...], lookback: int = 120) -> int:
+    count = 0
+    for ln in lines[-lookback:]:
+        low = ln.lower()
+        if any(k in low for k in keywords):
+            count += 1
+    return count
+
+
+def _human_delta(delta: timedelta) -> str:
+    mins = int(max(0, delta.total_seconds()) // 60)
+    if mins < 60:
+        return f"{mins} 分鐘"
+    return f"{mins // 60} 小時 {mins % 60} 分鐘"
+
+
 def _compute_alerts(last_trade: Dict[str, Any], status_en: str) -> Tuple[str, str, str, List[str]]:
     risk = last_trade.get("risk_control") if isinstance(last_trade.get("risk_control"), dict) else {}
     tri = last_trade.get("tri_brain_status") if isinstance(last_trade.get("tri_brain_status"), dict) else {}
@@ -512,6 +581,157 @@ def _compute_alerts(last_trade: Dict[str, Any], status_en: str) -> Tuple[str, st
     return level, "警示（Alert）" if level != "bad" else "危險（Danger）", "；".join(alerts), alerts
 
 
+def _build_health_and_transparency(
+    last_trade: Dict[str, Any],
+    cron_tail: List[str],
+    last_seen: Optional[datetime],
+    interval: int,
+    en_status: str,
+    is_stuck: bool,
+) -> Tuple[int, Dict[str, Any], str, Dict[str, str]]:
+    now = datetime.now().astimezone()
+    tri = last_trade.get("tri_brain_status") if isinstance(last_trade.get("tri_brain_status"), dict) else {}
+    risk = last_trade.get("risk_control") if isinstance(last_trade.get("risk_control"), dict) else {}
+
+    gemini = tri.get("gemini") if isinstance(tri.get("gemini"), dict) else {}
+    groq = tri.get("groq") if isinstance(tri.get("groq"), dict) else {}
+    openai = tri.get("openai") if isinstance(tri.get("openai"), dict) else {}
+
+    recent_429 = _count_recent_matches(cron_tail, ("429", "quota", "rate limit", "http_retryable"), lookback=160)
+    recent_conn_err = _count_recent_matches(cron_tail, ("connection", "timeout", "network", "dns", "unreachable"), lookback=160)
+    anomaly_penalty = min(30, recent_429 * 6 + recent_conn_err * 5)
+
+    lock_file = DATA_DIR / "trade_analyst.lock"
+    lock_age_mins: Optional[int] = None
+    if lock_file.exists():
+        try:
+            lock_age = now - datetime.fromtimestamp(lock_file.stat().st_mtime, tz=timezone.utc).astimezone()
+            lock_age_mins = int(lock_age.total_seconds() // 60)
+        except Exception:
+            lock_age_mins = None
+
+    backlog_penalty = 0
+    backlog_reasons: List[str] = []
+    if is_stuck or en_status == "Stuck":
+        backlog_penalty += 18
+        backlog_reasons.append("排程疑似卡住")
+    if lock_age_mins is not None and lock_age_mins > max(45, interval * 2):
+        backlog_penalty += min(12, lock_age_mins // 20)
+        backlog_reasons.append(f"lock 檔存在 {lock_age_mins} 分鐘")
+    cron_fail = _count_recent_matches(cron_tail, ("failed", "traceback", "exception", "command not found"), lookback=120)
+    if cron_fail > 0:
+        backlog_penalty += min(10, cron_fail * 3)
+        backlog_reasons.append(f"近期可疑失敗 {cron_fail} 次")
+    backlog_penalty = min(30, backlog_penalty)
+
+    stale_penalty = 0
+    stale_msg = "K線更新正常"
+    trade_ts: Optional[datetime] = None
+    date_raw = last_trade.get("date")
+    if isinstance(date_raw, str) and date_raw.strip():
+        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S%z", "%Y-%m-%dT%H:%M:%S.%f%z"):
+            try:
+                trade_ts = datetime.strptime(date_raw, fmt)
+                if trade_ts.tzinfo is None:
+                    trade_ts = trade_ts.replace(tzinfo=now.tzinfo)
+                break
+            except Exception:
+                continue
+    if trade_ts and trade_ts.tzinfo is not None:
+        stale_age = now - trade_ts.astimezone(now.tzinfo)
+        stale_mins = int(stale_age.total_seconds() // 60)
+        if stale_mins > 90:
+            stale_penalty = min(25, 8 + stale_mins // 30)
+            stale_msg = f"K線 {stale_mins} 分鐘未更新"
+        else:
+            stale_msg = f"最近更新 {_human_delta(stale_age)} 前"
+    else:
+        stale_penalty = 12
+        stale_msg = "無法判定 K線時間，套用保守扣分"
+
+    budget_proxy = (
+        (1 if gemini.get("status") in ("fallback", "failed", "unavailable") else 0)
+        + (1 if groq.get("status") in ("fallback", "failed", "unavailable") else 0)
+        + (1 if openai.get("status") in ("fallback", "failed", "unavailable") else 0)
+    )
+    cooldown_active = bool((risk.get("gemini_cooldown") or {}).get("active")) if isinstance(risk.get("gemini_cooldown"), dict) else False
+    budget_penalty = min(25, budget_proxy * 5 + min(10, recent_429 * 2) + (6 if cooldown_active else 0))
+
+    health_score = max(0, 100 - anomaly_penalty - backlog_penalty - stale_penalty - budget_penalty)
+
+    anomaly_bad = (recent_429 + recent_conn_err) > 0
+    anomaly_text = "AI 休息中，數學模型代班" if anomaly_bad else "AI 連線穩定"
+
+    health_factors = {
+        "anomaly_stagnation": {
+            "zh": "異常停滯",
+            "en": "Anomaly/Stagnation",
+            "penalty": anomaly_penalty,
+            "status": "warn" if anomaly_bad else "ok",
+            "detail": f"429={recent_429}, conn_error={recent_conn_err}; {anomaly_text}",
+        },
+        "task_backlog": {
+            "zh": "任務積壓",
+            "en": "Task Backlog",
+            "penalty": backlog_penalty,
+            "status": "warn" if backlog_penalty > 0 else "ok",
+            "detail": "；".join(backlog_reasons) if backlog_reasons else "排程節奏正常",
+        },
+        "stale_execution": {
+            "zh": "無效執行",
+            "en": "Stale Execution",
+            "penalty": stale_penalty,
+            "status": "warn" if stale_penalty > 0 else "ok",
+            "detail": stale_msg,
+        },
+        "budget_risk_proxy": {
+            "zh": "預算風險",
+            "en": "Budget Risk (Proxy)",
+            "penalty": budget_penalty,
+            "status": "warn" if budget_penalty > 0 else "ok",
+            "detail": f"proxy=fallback({budget_proxy}) cooldown={cooldown_active} 429={recent_429}；無官方額度 API，採代理指標估算",
+        },
+    }
+
+    summary_bits = []
+    if anomaly_bad:
+        summary_bits.append("AI 休息中，數學模型代班")
+    if backlog_penalty > 0:
+        summary_bits.append("排程有積壓風險")
+    if stale_penalty > 0:
+        summary_bits.append("K線更新延遲")
+    if budget_penalty > 0:
+        summary_bits.append("額度壓力偏高（代理）")
+    health_summary_message = "；".join(summary_bits) if summary_bits else "系統健康，持續監控中（Healthy and monitoring）"
+
+    now_ref = last_seen or now
+    eta = now_ref + timedelta(minutes=interval)
+    countdown = eta - now
+    if countdown.total_seconds() < 0:
+        countdown_txt = f"已超時 {int(abs(countdown.total_seconds()) // 60)} 分鐘"
+    else:
+        countdown_txt = _human_delta(countdown)
+
+    connectivity = "穩定" if (recent_conn_err == 0 and recent_429 == 0) else f"波動（429={recent_429}, conn={recent_conn_err}）"
+    major_event = " / ".join([ln for ln in cron_tail[-20:] if "gemini_" in ln or "error" in ln.lower()][-1:]) or "近期無重大異常"
+    major_event = major_event[:220]
+
+    routing = "Fallback/數學模型"
+    for name, node in (("Gemini", gemini), ("Groq", groq), ("OpenAI", openai)):
+        if isinstance(node, dict) and node.get("status") not in ("fallback", "failed", "unavailable", None, ""):
+            routing = name
+            break
+
+    transparency = {
+        "what_happened": f"連線品質：{connectivity}；最後重大事件：{major_event}",
+        "whats_the_job": "標的：YM=F；任務：15m K線 + EMA/RSI/MACD 分析、風控與交易計畫輸出",
+        "progressing": f"下次看盤倒數：{countdown_txt}；排程間隔：{interval} 分鐘；執行狀態：{en_status}",
+        "ai_routing": f"目前決策路由：{routing}（Gemini/Groq/OpenAI + fallback）",
+    }
+
+    return health_score, health_factors, health_summary_message, transparency
+
+
 def collect_snapshot() -> Dict[str, Any]:
     last_trade = _last_trade()
     cron_tail = _tail_lines(CRON_LOG, 200)
@@ -532,11 +752,16 @@ def collect_snapshot() -> Dict[str, Any]:
     trade_items: List[str] = []
     all_logs = _safe_read_json(TRADE_LOG_JSON, [])
     if isinstance(all_logs, list):
-        for item in all_logs[-3:]:
+        for item in all_logs[-5:]:
             if not isinstance(item, dict):
                 continue
+            date_v = item.get('date')
+            entry_v = item.get('entry_price')
+            exp_v = item.get('expected_profit_points')
+            if date_v is None and entry_v is None and exp_v is None:
+                continue
             trade_items.append(
-                f"{item.get('date', 'MISSING')} | entry={item.get('entry_price', 'MISSING')} | exp={item.get('expected_profit_points', 'MISSING')}"
+                f"{date_v or '-'} | entry={entry_v if entry_v is not None else '-'} | exp={exp_v if exp_v is not None else '-'}"
             )
     if not trade_items:
         trade_items = ["MISSING"]
@@ -574,10 +799,26 @@ def collect_snapshot() -> Dict[str, Any]:
     alert_level, action_text, action_detail, alerts = _compute_alerts(last_trade, en_status)
 
     health = _collect_health(cron_tail)
+    health_score, health_factors, health_summary_message, transparency = _build_health_and_transparency(
+        last_trade=last_trade,
+        cron_tail=cron_tail,
+        last_seen=last_seen,
+        interval=interval,
+        en_status=en_status,
+        is_stuck=is_stuck,
+    )
 
     return {
         "generated_at": datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S %Z"),
+        "data_source_path": str(DATA_DIR),
         "status": {"en": en_status, "zh": zh_status},
+        "health_score": health_score,
+        "health_factors": health_factors,
+        "health_summary_message": health_summary_message,
+        "what_happened": transparency["what_happened"],
+        "whats_the_job": transparency["whats_the_job"],
+        "progressing": transparency["progressing"],
+        "ai_routing": transparency["ai_routing"],
         "hero": {
             "current_action": {"text": action_text, "detail": action_detail, "level": alert_level},
             "system_status": {
@@ -593,7 +834,11 @@ def collect_snapshot() -> Dict[str, Any]:
             "trades": trade_items,
         },
         "scheduler": scheduler,
-        "health_summary": health,
+        "health_summary": {
+            **health,
+            "health_score（健康分）": health_score,
+            "health_summary_message（摘要）": health_summary_message,
+        },
         "alerts": alerts,
         "trade_snapshot": {
             "date": _fmt_missing(last_trade.get("date")),
