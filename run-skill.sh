@@ -33,6 +33,7 @@ if [[ -z "$skill" ]]; then
   echo "  $0 trade-health-check" >&2
   echo "  $0 batch-review-10" >&2
   echo "  $0 monitor-dashboard" >&2
+  echo "  $0 monitor-dashboard-web" >&2
   exit 2
 fi
 shift || true

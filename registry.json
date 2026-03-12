@@ -50,5 +50,9 @@
   "monitor-dashboard": {
     "description": "Open bilingual live monitor dashboard in terminal",
     "command": "python3 scripts/live_monitor_dashboard.py"
+  },
+  "monitor-dashboard-web": {
+    "description": "Open bilingual web live monitor dashboard (HTTP)",
+    "command": "python3 scripts/live_monitor_web.py"
   }
 }
