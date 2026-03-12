@@ -36,15 +36,22 @@ def load_kv_env(env_path: Path) -> Dict[str, str]:
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Send Telegram message via Bot API")
-    parser.add_argument("--message", required=True, help="Message text")
+    parser = argparse.ArgumentParser(description="Send Telegram message or document via Bot API")
+    parser.add_argument("--message", help="Message text (for sendMessage; also used as default caption when --file)")
+    parser.add_argument("--file", help="Path to file to send as Telegram document")
+    parser.add_argument("--caption", help="Caption text for --file")
     parser.add_argument(
         "--env-file",
         default=os.getenv("OPENCLAW_ENV_FILE", str(DEFAULT_ENV_PATH)),
         help="Path to env file (default: OPENCLAW_ENV_FILE or /root/.openclaw_env)",
     )
     parser.add_argument("--timeout", type=float, default=10.0, help="Request timeout in seconds")
-    return parser.parse_args()
+    args = parser.parse_args()
+
+    if not args.message and not args.file:
+        parser.error("at least one of --message or --file is required")
+
+    return args
 
 
 def main() -> int:
@@ -68,6 +75,46 @@ def main() -> int:
             file=sys.stderr,
         )
         return 2
+
+    if args.file:
+        file_path = Path(args.file)
+        if not file_path.exists() or not file_path.is_file():
+            print(f"[error] File not found: {file_path}", file=sys.stderr)
+            return 1
+
+        url = f"https://api.telegram.org/bot{token}/sendDocument"
+        caption = args.caption if args.caption is not None else args.message
+        payload = {"chat_id": chat_id}
+        if caption:
+            payload["caption"] = caption
+
+        try:
+            with file_path.open("rb") as fh:
+                response = requests.post(
+                    url,
+                    data=payload,
+                    files={"document": (file_path.name, fh)},
+                    timeout=args.timeout,
+                )
+        except Exception as e:
+            print(f"[error] Telegram request failed: {e}", file=sys.stderr)
+            return 1
+
+        if response.status_code != 200:
+            print(f"[error] Telegram API returned HTTP {response.status_code}", file=sys.stderr)
+            return 1
+
+        try:
+            body = response.json()
+        except Exception:
+            body = {}
+
+        if not body.get("ok", False):
+            print("[error] Telegram API response not ok", file=sys.stderr)
+            return 1
+
+        print(f"[ok] Telegram document sent: {file_path.name}")
+        return 0
 
     url = f"https://api.telegram.org/bot{token}/sendMessage"
     payload = {"chat_id": chat_id, "text": args.message}

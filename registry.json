@@ -28,7 +28,7 @@
     "command": "python3 scripts/ai_orchestrator.py"
   },
   "report-generator": {
-    "description": "Generate Excel report from data/trade_logs.json",
+    "description": "Generate Excel report from data/trade_logs.json and auto-send to Telegram (graceful skip if env missing)",
     "command": "python3 scripts/json_to_excel.py"
   }
 }

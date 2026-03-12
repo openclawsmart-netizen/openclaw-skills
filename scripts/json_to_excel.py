@@ -8,13 +8,15 @@ Features:
 - Flatten nested fields (including prior_trade_status)
 - Keep P/L color highlighting
 - Keep long-text wrapping
-- Output xlsx path and ask Telegram send question
+- Auto-send generated Excel to Telegram (graceful skip if env missing)
 """
 
 from __future__ import annotations
 
 import json
 import os
+import subprocess
+import sys
 from datetime import datetime
 from typing import Any
 
@@ -25,6 +27,7 @@ from openpyxl.styles import Alignment, PatternFill
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 JSON_PATH = os.path.join(ROOT_DIR, "data", "trade_logs.json")
 REPORT_DIR = os.path.join(ROOT_DIR, "reports")
+TELEGRAM_SCRIPT = os.path.join(ROOT_DIR, "proactive-agent", "send_telegram.py")
 
 GREEN_FILL = PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid")
 RED_FILL = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")
@@ -56,10 +59,42 @@ def _calc_actual_outcome(row: pd.Series) -> str:
     return "NA"
 
 
+def _send_report_via_telegram(xlsx_path: str) -> int:
+    if not os.path.exists(TELEGRAM_SCRIPT):
+        print(f"[warn] Telegram script not found: {TELEGRAM_SCRIPT}", file=sys.stderr)
+        return 0
+
+    cmd = [
+        sys.executable,
+        TELEGRAM_SCRIPT,
+        "--file",
+        xlsx_path,
+        "--caption",
+        f"[report-generator] 交易報表：{os.path.basename(xlsx_path)}",
+    ]
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+
+    stdout = (proc.stdout or "").strip()
+    stderr = (proc.stderr or "").strip()
+    if stdout:
+        print(stdout)
+    if stderr:
+        print(stderr, file=sys.stderr)
+
+    if proc.returncode == 0:
+        print("[ok] Auto-sent report via Telegram")
+    elif proc.returncode == 2:
+        print("[skip] Telegram env not configured; report generated locally")
+        return 0
+    else:
+        print(f"[warn] Telegram send failed with code {proc.returncode}; report kept locally")
+
+    return 0
+
+
 def main() -> int:
     if not os.path.exists(JSON_PATH):
         print(f"[warn] JSON file not found: {JSON_PATH}")
-        print("是否要透過 Telegram 發送檔案？")
         return 0
 
     try:
@@ -67,18 +102,15 @@ def main() -> int:
             data = json.load(f)
     except Exception as exc:
         print(f"[error] Failed to read JSON: {exc}")
-        print("是否要透過 Telegram 發送檔案？")
         return 1
 
     if not isinstance(data, list) or not data:
         print(f"[warn] No valid records in: {JSON_PATH}")
-        print("是否要透過 Telegram 發送檔案？")
         return 0
 
     rows = [x for x in data if isinstance(x, dict)]
     if not rows:
         print(f"[warn] No valid object rows in: {JSON_PATH}")
-        print("是否要透過 Telegram 發送檔案？")
         return 0
 
     df = pd.json_normalize(rows, sep="_")
@@ -130,8 +162,7 @@ def main() -> int:
                     cell.fill = RED_FILL
 
     print(out_path)
-    print("是否要透過 Telegram 發送檔案？")
-    return 0
+    return _send_report_via_telegram(out_path)
 
 
 if __name__ == "__main__":
