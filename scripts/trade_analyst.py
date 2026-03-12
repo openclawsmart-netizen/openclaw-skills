@@ -19,6 +19,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import random
 import sqlite3
 import subprocess
 import sys
@@ -47,6 +48,8 @@ CONSULTANT_COMMANDER_ROLLOVER_TAG = "🚨 [諮詢-指揮官]：目前處於換�
 
 BASE_DIR = Path(__file__).resolve().parents[1]
 DATA_DIR = BASE_DIR / "data"
+LOG_DIR = BASE_DIR / "logs"
+CRON_TRADE_LOG = LOG_DIR / "cron_trade.log"
 DB_PATH = DATA_DIR / "trading_v1.db"
 TRADE_LOG_JSON = DATA_DIR / "trade_logs.json"
 TRADE_LOG_CSV = DATA_DIR / "trade_logs.csv"
@@ -121,6 +124,15 @@ class RolloverDecision:
 
 def eprint(msg: str) -> None:
     print(msg, file=sys.stderr)
+
+
+def append_cron_trade_log(message: str) -> None:
+    try:
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
+        with CRON_TRADE_LOG.open("a", encoding="utf-8") as f:
+            f.write(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {message}\n")
+    except Exception as exc:
+        eprint(f"[warn] failed writing cron trade log: {exc}")
 
 
 def now_iso() -> str:
@@ -1042,6 +1054,34 @@ def _get_requests_module():
         return None
 
 
+def _summarize_error_message(msg: str, limit: int = 220) -> str:
+    clean = " ".join(str(msg or "").split())
+    return clean[:limit]
+
+
+def _is_retryable_gemini_http(status_code: int) -> bool:
+    return status_code == 429 or 500 <= status_code <= 599
+
+
+def _is_retryable_gemini_exception(exc: Exception) -> bool:
+    name = exc.__class__.__name__.lower()
+    msg = str(exc).lower()
+    retryable_hints = [
+        "timeout",
+        "timed out",
+        "temporarily unavailable",
+        "connection reset",
+        "connection aborted",
+        "connection refused",
+        "name resolution",
+        "dns",
+        "ssl",
+        "readtimeout",
+        "connecttimeout",
+    ]
+    return ("timeout" in name) or any(h in msg for h in retryable_hints)
+
+
 def normalize_risk(parsed: Dict[str, Any], s: Snapshot, degraded: bool = False) -> Dict[str, Any]:
     fallback_score = 5 + (1 if abs(s.bias_ema20) > 0.8 else 0) + (1 if abs(s.bias_ema50) > 1.2 else 0)
     risk_level = int(clamp(round(safe_float(parsed.get("risk_level"), fallback_score)), 0, 10))
@@ -1199,7 +1239,11 @@ def step2_gemini_strategy(
         return {"status": "fallback", "reason": reason, "raw_json": payload}
 
     if not key or requests is None:
-        return fallback("missing GEMINI_API_KEY/GOOGLE_API_KEY" if not key else "missing requests dependency")
+        reason = "missing GEMINI_API_KEY/GOOGLE_API_KEY" if not key else "missing requests dependency"
+        append_cron_trade_log(
+            f"gemini_error status=NA error_type=precheck_non_retryable attempt=0/0 message={reason}"
+        )
+        return fallback(reason)
 
     optimization_requirement = (
         "optimization_suggestion 欄位必填，且需針對『月獲利1000點目標』提供可執行修正方案（不得空白、不得泛談）。"
@@ -1233,24 +1277,65 @@ def step2_gemini_strategy(
         "generationConfig": {"temperature": 0.15, "maxOutputTokens": 600},
     }
 
-    try:
-        resp = requests.post(url, params={"key": key}, json=payload, timeout=25)
-        if resp.status_code != 200:
-            return fallback(f"Gemini HTTP {resp.status_code}")
+    max_attempts = 4
+    request_timeout_seconds = 45
+    base_backoff_seconds = 1.2
+    last_error_reason = ""
 
-        text = (
-            resp.json().get("candidates", [{}])[0]
-            .get("content", {})
-            .get("parts", [{}])[0]
-            .get("text", "")
-        )
-        parsed = extract_json_object(text)
-        if not parsed:
-            return fallback("Gemini non-json response")
+    for attempt in range(1, max_attempts + 1):
+        try:
+            resp = requests.post(url, params={"key": key}, json=payload, timeout=request_timeout_seconds)
+            status = int(getattr(resp, "status_code", 0) or 0)
 
-        return {"status": "ok", "reason": "", "raw_json": parsed}
-    except Exception as exc:
-        return fallback(f"Gemini exception: {exc}")
+            if status == 200:
+                text = (
+                    resp.json().get("candidates", [{}])[0]
+                    .get("content", {})
+                    .get("parts", [{}])[0]
+                    .get("text", "")
+                )
+                parsed = extract_json_object(text)
+                if not parsed:
+                    reason = "Gemini non-json response"
+                    append_cron_trade_log(
+                        f"gemini_error status=200 error_type=non_json attempt={attempt}/{max_attempts} message={reason}"
+                    )
+                    return fallback(reason)
+                return {"status": "ok", "reason": "", "raw_json": parsed}
+
+            body_msg = ""
+            try:
+                body_msg = _summarize_error_message(resp.text)
+            except Exception:
+                body_msg = ""
+
+            error_type = "http_retryable" if _is_retryable_gemini_http(status) else "http_non_retryable"
+            last_error_reason = f"Gemini HTTP {status}"
+            append_cron_trade_log(
+                f"gemini_error status={status} error_type={error_type} attempt={attempt}/{max_attempts} message={body_msg or last_error_reason}"
+            )
+
+            if _is_retryable_gemini_http(status) and attempt < max_attempts:
+                sleep_s = base_backoff_seconds * (2 ** (attempt - 1)) + random.uniform(0.0, 0.6)
+                time.sleep(sleep_s)
+                continue
+
+            return fallback(last_error_reason)
+        except Exception as exc:
+            retryable = _is_retryable_gemini_exception(exc)
+            error_type = "exception_retryable" if retryable else "exception_non_retryable"
+            last_error_reason = f"Gemini exception: {exc}"
+            append_cron_trade_log(
+                f"gemini_error status=NA error_type={error_type} attempt={attempt}/{max_attempts} message={_summarize_error_message(str(exc))}"
+            )
+
+            if retryable and attempt < max_attempts:
+                sleep_s = base_backoff_seconds * (2 ** (attempt - 1)) + random.uniform(0.0, 0.6)
+                time.sleep(sleep_s)
+                continue
+            return fallback(last_error_reason)
+
+    return fallback(last_error_reason or "Gemini retry exhausted")
 
 
 def normalize_plan_payload(payload: Dict[str, Any], s: Snapshot) -> Plan:
