@@ -375,8 +375,17 @@ HTML_PAGE = """<!doctype html>
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ source: 'dashboard' }),
         });
-        const data = await res.json();
-        msg.textContent = `${data.ok ? '✅' : '❌'} ${data.message || '-'}${data.path ? ' | ' + data.path : ''}`;
+
+        let data = {};
+        try {
+          data = await res.json();
+        } catch (_) {
+          data = {};
+        }
+
+        const baseMsg = data.message || data.error || res.statusText || '-';
+        const detail = `${res.status} ${res.statusText}`;
+        msg.textContent = `${res.ok && data.ok !== false ? '✅' : '❌'} ${baseMsg} [HTTP ${detail}]${data.path ? ' | ' + data.path : ''}`;
       } catch (err) {
         msg.textContent = `❌ 請求失敗（Request Failed）: ${err}`;
       }
@@ -392,8 +401,17 @@ HTML_PAGE = """<!doctype html>
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ jobName }),
         });
-        const data = await res.json();
-        msg.textContent = `${data.ok ? '✅' : '❌'} ${data.message || '-'} (${jobName})`;
+
+        let data = {};
+        try {
+          data = await res.json();
+        } catch (_) {
+          data = {};
+        }
+
+        const baseMsg = data.message || data.error || res.statusText || '-';
+        const detail = `${res.status} ${res.statusText}`;
+        msg.textContent = `${res.ok && data.ok !== false ? '✅' : '❌'} ${baseMsg} [HTTP ${detail}] (${jobName})`;
       } catch (err) {
         msg.textContent = `❌ 請求失敗（Request Failed）: ${err}`;
       }
@@ -1304,12 +1322,14 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _forbid_non_localhost(self) -> bool:
-        if self.client_address[0] != "127.0.0.1":
+        client_ip = self.client_address[0]
+        allowed = {"127.0.0.1", "::1", "localhost"}
+        if client_ip not in allowed:
             self._send_json(
                 {
                     "ok": False,
-                    "message": "拒絕：僅允許 127.0.0.1 呼叫變更操作（only localhost 127.0.0.1 allowed）",
-                    "client": self.client_address[0],
+                    "message": "拒絕：僅允許本機呼叫（127.0.0.1 / ::1 / localhost）",
+                    "client": client_ip,
                 },
                 status=403,
             )
