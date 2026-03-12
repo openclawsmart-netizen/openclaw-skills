@@ -44,6 +44,25 @@ MANUAL_APPRENTICE_LOG = LOGS_DIR / "cron_apprentice_manual.log"
 TRADE_ANALYST_CRON_TAG = "run-skill.sh trade-analyst"
 TRADE_ANALYST_SAFE_CRON = f"*/30 * * * * cd {BASE_DIR} && ./run-skill.sh trade-analyst >> logs/cron_trade.log 2>&1"
 
+REGISTRY_JSON = BASE_DIR / "registry.json"
+RUN_SKILL = BASE_DIR / "run-skill.sh"
+TRADE_ANALYST_LOCK = DATA_DIR / "trade_analyst.lock"
+
+JOB_SCHEDULES: Dict[str, str] = {
+    "trade-analyst": f"*/30 * * * * cd {BASE_DIR} && ./run-skill.sh trade-analyst >> logs/cron_trade.log 2>&1",
+    "daily-brief": f"0 9 * * * cd {BASE_DIR} && ./run-skill.sh daily-brief >> logs/cron_daily_brief.log 2>&1",
+    "report-generator": f"30 9 * * * cd {BASE_DIR} && ./run-skill.sh report-generator >> logs/cron_report_generator.log 2>&1",
+}
+
+JOB_LAST_RUN_HINTS: Dict[str, List[Path]] = {
+    "trade-analyst": [DATA_DIR / "trade_logs.json", DATA_DIR / "trade_logs.csv", LOGS_DIR / "cron_trade.log"],
+    "daily-brief": [LOGS_DIR / "cron_daily_brief.log"],
+    "report-generator": [REPORTS_DIR, LOGS_DIR / "cron_report_generator.log"],
+    "trade-health-check": [LOGS_DIR / "cron_trade_health.log", DATA_DIR / "trade_logs.json"],
+    "monitor-dashboard": [LOGS_DIR / "cron_monitor_dashboard.log"],
+    "monitor-dashboard-web": [LOGS_DIR / "cron_monitor_dashboard_web.log"],
+}
+
 HTML_PAGE = """<!doctype html>
 <html lang="zh-Hant">
 <head>
@@ -168,6 +187,34 @@ HTML_PAGE = """<!doctype html>
     .v { word-break: break-word; }
     .missing { color: #fda4af; font-weight: 600; }
     .small { font-size: 12px; color: var(--muted); }
+    .jobs-wrap {
+      padding: 0 12px 12px 12px;
+    }
+    .jobs-table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 12px;
+    }
+    .jobs-table th, .jobs-table td {
+      border: 1px solid var(--border);
+      padding: 6px;
+      vertical-align: top;
+      text-align: left;
+    }
+    .jobs-table th {
+      color: var(--accent);
+      background: #0f172a;
+    }
+    .jobs-actions {
+      display: flex;
+      gap: 6px;
+      flex-wrap: wrap;
+    }
+    .jobs-actions button {
+      padding: 6px 8px;
+      font-size: 12px;
+      border-radius: 8px;
+    }
   </style>
 </head>
 <body>
@@ -200,6 +247,27 @@ HTML_PAGE = """<!doctype html>
     <button onclick="runAction('/api/actions/run-apprentice')">手動跑 Apprentice（Run Apprentice）</button>
     <button onclick="runAction('/api/actions/export-latest-report')">匯出最新報告（Export Latest Report）</button>
     <div id="actionMsg" class="action-msg">-</div>
+  </section>
+
+  <section class="jobs-wrap">
+    <section class="card">
+      <h2>工作清單（Jobs Table）</h2>
+      <div id="jobMsg" class="action-msg">-</div>
+      <table class="jobs-table">
+        <thead>
+          <tr>
+            <th>工作名稱<br/>Job Name</th>
+            <th>說明<br/>Description</th>
+            <th>指令<br/>Command</th>
+            <th>類型<br/>Type</th>
+            <th>狀態<br/>Status</th>
+            <th>最後執行<br/>Last Run</th>
+            <th>操作<br/>Actions</th>
+          </tr>
+        </thead>
+        <tbody id="jobsTableBody"></tbody>
+      </table>
+    </section>
   </section>
 
   <main class="grid">
@@ -315,6 +383,78 @@ HTML_PAGE = """<!doctype html>
       await refresh();
     }
 
+    async function runJobAction(path, jobName) {
+      const msg = document.getElementById('jobMsg');
+      msg.textContent = `執行中（Running）... ${jobName}`;
+      try {
+        const res = await fetch(path, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ jobName }),
+        });
+        const data = await res.json();
+        msg.textContent = `${data.ok ? '✅' : '❌'} ${data.message || '-'} (${jobName})`;
+      } catch (err) {
+        msg.textContent = `❌ 請求失敗（Request Failed）: ${err}`;
+      }
+      await refreshJobs();
+    }
+
+    function renderJobs(jobs) {
+      const body = document.getElementById('jobsTableBody');
+      body.innerHTML = '';
+      (jobs || []).forEach((job) => {
+        const tr = document.createElement('tr');
+        const cols = [
+          job.jobName,
+          job.description,
+          job.command,
+          job.type,
+          job.status,
+          job.lastRun,
+        ];
+        cols.forEach((c) => {
+          const td = document.createElement('td');
+          td.textContent = String(c ?? MISSING);
+          if (String(c ?? MISSING) === MISSING) td.classList.add('missing');
+          tr.appendChild(td);
+        });
+
+        const tdAction = document.createElement('td');
+        tdAction.className = 'jobs-actions';
+
+        const runBtn = document.createElement('button');
+        runBtn.textContent = 'Run Now';
+        runBtn.onclick = () => runJobAction('/api/jobs/run', job.jobName);
+        tdAction.appendChild(runBtn);
+
+        const enBtn = document.createElement('button');
+        enBtn.textContent = 'Enable';
+        enBtn.className = 'safe';
+        enBtn.onclick = () => runJobAction('/api/jobs/enable', job.jobName);
+        tdAction.appendChild(enBtn);
+
+        const disBtn = document.createElement('button');
+        disBtn.textContent = 'Disable';
+        disBtn.className = 'danger';
+        disBtn.onclick = () => runJobAction('/api/jobs/disable', job.jobName);
+        tdAction.appendChild(disBtn);
+
+        tr.appendChild(tdAction);
+        body.appendChild(tr);
+      });
+    }
+
+    async function refreshJobs() {
+      try {
+        const res = await fetch('/api/jobs?_=' + Date.now(), { cache: 'no-store' });
+        const data = await res.json();
+        renderJobs(data.jobs || []);
+      } catch (err) {
+        document.getElementById('jobMsg').textContent = '❌ 讀取工作清單失敗';
+      }
+    }
+
     async function refresh() {
       try {
         const res = await fetch('/api/snapshot?_=' + Date.now(), { cache: 'no-store' });
@@ -351,7 +491,7 @@ HTML_PAGE = """<!doctype html>
         setHealthFactors(data?.health_factors || {});
         setTable('taskTransparency', {
           '發生什麼事 What happened': data?.what_happened ?? MISSING,
-          '現在做什麼 What\'s the job': data?.whats_the_job ?? MISSING,
+          '現在做什麼 What is the job': data?.whats_the_job ?? MISSING,
           '進度 Progressing': data?.progressing ?? MISSING,
           'AI 路由 AI routing': data?.ai_routing ?? MISSING,
         });
@@ -364,7 +504,9 @@ HTML_PAGE = """<!doctype html>
     }
 
     refresh();
+    refreshJobs();
     setInterval(refresh, 3000);
+    setInterval(refreshJobs, 5000);
   </script>
 </body>
 </html>
@@ -936,8 +1078,199 @@ def export_latest_report() -> Tuple[bool, str, Optional[str]]:
     return True, "已找到最新報告（latest report found）", str(p)
 
 
+def _load_registry_jobs() -> Dict[str, Dict[str, str]]:
+    zh_desc = {
+        "trade-analyst": "交易分析主程式（15m 技術指標 + 風控 + 訊息）",
+        "daily-brief": "每日簡報（新聞摘要 + Telegram 推送）",
+        "report-generator": "報表產生器（交易紀錄轉 Excel 並推送）",
+        "trade-health-check": "交易健康檢查（檢查最新交易狀態）",
+        "monitor-dashboard": "終端機監控儀表板",
+        "monitor-dashboard-web": "Web 監控儀表板",
+    }
+    data = _safe_read_json(REGISTRY_JSON, {})
+    if not isinstance(data, dict):
+        return {}
+    out: Dict[str, Dict[str, str]] = {}
+    for job_name, meta in data.items():
+        if not isinstance(meta, dict):
+            continue
+        description = str(meta.get("description") or "MISSING")
+        if not re.search(r"[\u4e00-\u9fff]", description) and job_name in zh_desc:
+            description = f"{zh_desc[job_name]} / {description}"
+        out[str(job_name)] = {
+            "description": description,
+            "command": str(meta.get("command") or f"./run-skill.sh {job_name}"),
+        }
+    return out
+
+
+def _parse_cron_job_states(lines: List[str]) -> Dict[str, str]:
+    states: Dict[str, str] = {}
+    for raw in lines:
+        stripped = raw.strip()
+        if not stripped:
+            continue
+        is_comment = stripped.startswith("#")
+        target = stripped[1:].strip() if is_comment else stripped
+        if "run-skill.sh" not in target:
+            continue
+        m = re.search(r"run-skill\.sh\s+([a-zA-Z0-9_-]+)", target)
+        if not m:
+            continue
+        job = m.group(1)
+        states[job] = "disabled" if is_comment else "enabled"
+    return states
+
+
+def _guess_last_run(job_name: str) -> str:
+    candidates = JOB_LAST_RUN_HINTS.get(job_name, [])
+    if not candidates:
+        candidates = [LOGS_DIR / f"cron_{job_name.replace('-', '_')}.log"]
+    latest: Optional[float] = None
+    for p in candidates:
+        try:
+            rp = p.resolve()
+            if rp.is_dir():
+                files = [x for x in rp.iterdir() if x.is_file()]
+                if not files:
+                    continue
+                mt = max(x.stat().st_mtime for x in files)
+            elif rp.exists():
+                mt = rp.stat().st_mtime
+            else:
+                continue
+            latest = mt if latest is None else max(latest, mt)
+        except Exception:
+            continue
+    if latest is None:
+        return "MISSING"
+    return datetime.fromtimestamp(latest, tz=timezone.utc).astimezone().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _is_job_running(job_name: str) -> bool:
+    if job_name == "trade-analyst" and TRADE_ANALYST_LOCK.exists():
+        return True
+    try:
+        res = subprocess.run(
+            ["bash", "-lc", f"pgrep -af 'run-skill\\.sh {job_name}|python3 .*{job_name.replace('-', '_')}'"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        return res.returncode == 0 and bool((res.stdout or "").strip())
+    except Exception:
+        return False
+
+
+def get_jobs_table() -> List[Dict[str, str]]:
+    registry = _load_registry_jobs()
+    ok, lines, _ = _get_crontab_raw()
+    cron_states = _parse_cron_job_states(lines if ok else [])
+
+    jobs: List[Dict[str, str]] = []
+    for job_name, meta in sorted(registry.items()):
+        has_schedule = job_name in JOB_SCHEDULES or job_name in cron_states
+        jtype = "cron" if has_schedule else "manual"
+        base_status = cron_states.get(job_name, "disabled" if has_schedule else "idle")
+        if _is_job_running(job_name):
+            status = "running"
+        elif jtype == "cron":
+            status = base_status
+        else:
+            status = "idle"
+
+        jobs.append(
+            {
+                "jobName": job_name,
+                "description": meta.get("description") or "MISSING",
+                "command": meta.get("command") or f"./run-skill.sh {job_name}",
+                "type": jtype,
+                "status": status,
+                "lastRun": _guess_last_run(job_name),
+            }
+        )
+    return jobs
+
+
+def run_job_now(job_name: str) -> Tuple[bool, str]:
+    registry = _load_registry_jobs()
+    if job_name not in registry:
+        return False, f"找不到工作（job not found）: {job_name}"
+    if not RUN_SKILL.exists():
+        return False, f"找不到 run-skill.sh: {RUN_SKILL}"
+    try:
+        log_path = LOGS_DIR / f"manual_{job_name.replace('-', '_')}.log"
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        logf = log_path.open("a", encoding="utf-8")
+        subprocess.Popen(
+            ["bash", "-lc", f"cd {BASE_DIR} && ./run-skill.sh {job_name}"],
+            stdout=logf,
+            stderr=logf,
+        )
+        return True, f"已觸發（triggered）{job_name}，log={log_path}"
+    except Exception as exc:
+        return False, f"執行失敗（run failed）: {exc}"
+
+
+def _toggle_job_schedule(job_name: str, enable: bool) -> Tuple[bool, str]:
+    if job_name not in JOB_SCHEDULES:
+        return False, f"not scheduled: {job_name}"
+
+    ok, lines, msg = _get_crontab_raw()
+    if not ok:
+        return False, f"讀取 crontab 失敗（read failed）: {msg}"
+
+    schedule_line = JOB_SCHEDULES[job_name]
+    out: List[str] = []
+    found = False
+    changed = False
+    for ln in lines:
+        candidate = ln.strip().lstrip("#").strip()
+        if f"run-skill.sh {job_name}" in candidate:
+            found = True
+            if enable:
+                out.append(schedule_line)
+                if ln.strip() != schedule_line:
+                    changed = True
+            else:
+                if not ln.strip().startswith("#"):
+                    out.append(f"# {candidate}")
+                    changed = True
+                else:
+                    out.append(ln)
+            continue
+        out.append(ln)
+
+    if enable and not found:
+        out.append(schedule_line)
+        changed = True
+
+    if not changed:
+        return True, f"{job_name} 無需變更（no change）"
+
+    ok_set, msg_set = _run_crontab(["-"], "\n".join(out).rstrip() + "\n")
+    if not ok_set:
+        return False, f"寫入 crontab 失敗（write failed）: {msg_set}"
+    action = "enabled" if enable else "disabled"
+    return True, f"{job_name} 已{action}"
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "LiveMonitorWeb/2.0"
+
+    def _read_json_body(self) -> Dict[str, Any]:
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except Exception:
+            length = 0
+        if length <= 0:
+            return {}
+        try:
+            raw = self.rfile.read(length)
+            data = json.loads(raw.decode("utf-8"))
+            return data if isinstance(data, dict) else {}
+        except Exception:
+            return {}
 
     def _send_json(self, payload: Dict[str, Any], status: int = 200) -> None:
         body = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
@@ -978,6 +1311,9 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/snapshot":
             self._send_json(collect_snapshot())
             return
+        if path == "/api/jobs":
+            self._send_json({"ok": True, "jobs": get_jobs_table()})
+            return
         if path == "/healthz":
             self._send_json({"ok": True})
             return
@@ -986,7 +1322,7 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:  # noqa: N802
         path = urlparse(self.path).path
 
-        if path.startswith("/api/actions/") and self._forbid_non_localhost():
+        if (path.startswith("/api/actions/") or path.startswith("/api/jobs/")) and self._forbid_non_localhost():
             return
 
         if path == "/api/actions/pause-trade-analyst":
@@ -1010,6 +1346,36 @@ class Handler(BaseHTTPRequestHandler):
             if report_path:
                 payload["path"] = report_path
             self._send_json(payload, status=200 if ok else 404)
+            return
+
+        if path == "/api/jobs/run":
+            body = self._read_json_body()
+            job_name = str(body.get("jobName") or "").strip()
+            if not job_name:
+                self._send_json({"ok": False, "message": "缺少 jobName"}, status=400)
+                return
+            ok, msg = run_job_now(job_name)
+            self._send_json({"ok": ok, "message": msg}, status=200 if ok else 400)
+            return
+
+        if path == "/api/jobs/enable":
+            body = self._read_json_body()
+            job_name = str(body.get("jobName") or "").strip()
+            if not job_name:
+                self._send_json({"ok": False, "message": "缺少 jobName"}, status=400)
+                return
+            ok, msg = _toggle_job_schedule(job_name, enable=True)
+            self._send_json({"ok": ok, "message": msg}, status=200 if ok else 400)
+            return
+
+        if path == "/api/jobs/disable":
+            body = self._read_json_body()
+            job_name = str(body.get("jobName") or "").strip()
+            if not job_name:
+                self._send_json({"ok": False, "message": "缺少 jobName"}, status=400)
+                return
+            ok, msg = _toggle_job_schedule(job_name, enable=False)
+            self._send_json({"ok": ok, "message": msg}, status=200 if ok else 400)
             return
 
         self._send_json({"ok": False, "error": "not found"}, status=404)
