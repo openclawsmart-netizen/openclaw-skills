@@ -68,9 +68,9 @@ class Snapshot:
 
 @dataclass
 class Plan:
-    sentiment_score: int
+    sentiment_score: float  # 0~1
     reflection_one_liner: str
-    action: str
+    action: str  # BUY/SELL/HOLD (external schema)
     entry: float
     sl: float
     tp: float
@@ -109,6 +109,35 @@ def safe_float(v: Any, default: float) -> float:
 
 def clamp(v: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, v))
+
+
+def normalize_sentiment_0_1(v: Any, default: float = 0.5) -> float:
+    fv = safe_float(v, default)
+    # backward-compatible: if model still returns 0~100, convert to 0~1
+    if fv > 1.0:
+        fv = fv / 100.0
+    return round(clamp(fv, 0.0, 1.0), 4)
+
+
+def normalize_action_external(v: Any) -> str:
+    a = str(v or "HOLD").upper().strip()
+    mapping = {
+        "BUY": "BUY",
+        "SELL": "SELL",
+        "HOLD": "HOLD",
+        "LONG": "BUY",
+        "SHORT": "SELL",
+    }
+    return mapping.get(a, "HOLD")
+
+
+def external_to_internal_side(action: str) -> Optional[str]:
+    a = normalize_action_external(action)
+    if a == "BUY":
+        return "LONG"
+    if a == "SELL":
+        return "SHORT"
+    return None
 
 
 def extract_json_object(text: str) -> Dict[str, Any]:
@@ -584,7 +613,7 @@ def build_strategy_mode_context(monthly: MonthlyProgress, recent_stats: Dict[str
 
     return StrategyModeContext(
         mode="Balanced",
-        context="在風險與機會間維持中性配置，依訊號品質決定 LONG/SHORT/HOLD。",
+        context="在風險與機會間維持中性配置，依訊號品質決定 BUY/SELL/HOLD。",
     )
 
 
@@ -725,14 +754,14 @@ def step2_gemini_strategy(
 
         action = "HOLD"
         if score >= 60 and risk_level <= 8:
-            action = "LONG"
+            action = "BUY"
         elif score <= 40 and risk_level <= 8:
-            action = "SHORT"
+            action = "SELL"
 
         band = max(s.close * 0.002, 25.0)
-        if action == "LONG":
+        if action == "BUY":
             sl, tp = s.close - band, s.close + band * 1.6
-        elif action == "SHORT":
+        elif action == "SELL":
             sl, tp = s.close + band, s.close - band * 1.6
         else:
             sl, tp = s.close - band, s.close + band
@@ -752,7 +781,7 @@ def step2_gemini_strategy(
             else "依近期勝率動態調整進場過濾條件與停損帶寬。"
         )
         payload = {
-            "sentiment_score": int(clamp(score, 0, 100)),
+            "sentiment_score": round(clamp(score, 0, 100) / 100.0, 4),
             "reflection_one_liner": "Gemini fallback：已整合風險哨兵與微觀特徵進行保守決策。",
             "action": action,
             "entry": round(s.close, 2),
@@ -777,8 +806,16 @@ def step2_gemini_strategy(
     )
 
     prompt = (
-        "你是 YM=F 15m 量化策略師。請只輸出 JSON。\n"
-        "必要欄位: sentiment_score(0-100 int), reflection_one_liner, action(LONG/SHORT/HOLD), entry, sl, tp, reason, optimization_suggestion, new_skill_proposal(null或{skill_name,reason})。\n"
+        "你是『道瓊 20 年華爾街量化策略師』，專做 YM=F 15m。請只輸出單一 JSON。\n"
+        "必要欄位: sentiment_score(0~1 float), reflection_one_liner, action(BUY/SELL/HOLD), entry, sl, tp, reason, optimization_suggestion, new_skill_proposal(null或{skill_name,reason})。\n"
+        "核心策略約束(必須明確納入 reason):\n"
+        "1) Price Action：重點看 15m candle_body、wick_ratio，特別留意整數關卡的假突破/回踩。\n"
+        "2) bias_ema50 過大時，優先考慮均值回歸逆勢。\n"
+        "3) candle_body 連續縮小後的突破，視為趨勢啟動線索。\n"
+        "4) 趨勢過濾：EMA20>EMA50 且斜率上行才偏多；若 RSI 在 30~70 震盪帶，偏高拋低吸。\n"
+        "5) 勝率優先，且 RR 必須 > 1.5；若不滿足則 HOLD。\n"
+        "6) 若連續虧損，必須檢視市場風格是否切換並降低進攻性。\n"
+        "7) 持續評估是否需要成分股權重/VIX 資訊，必要時於 new_skill_proposal 提案。\n"
         "你必須結合：K線+微觀特徵(candle_body/upper_wick_ratio/lower_wick_ratio/bias_ema20/bias_ema50)+Groq風險訊號。\n"
         f"策略模式: mode={mode_ctx.mode}, context={mode_ctx.context}\n"
         f"月目標進度: current_pnl={monthly.current_pnl:.2f}, target={MONTHLY_TARGET_POINTS:.0f}, achievement_pct={monthly.achievement_pct:.2f}, remaining={monthly.remaining:.2f}\n"
@@ -815,10 +852,8 @@ def step2_gemini_strategy(
 
 
 def normalize_plan_payload(payload: Dict[str, Any], s: Snapshot) -> Plan:
-    sentiment = int(clamp(round(safe_float(payload.get("sentiment_score"), 50)), 0, 100))
-    action = str(payload.get("action", "HOLD")).upper().strip()
-    if action not in {"LONG", "SHORT", "HOLD"}:
-        action = "HOLD"
+    sentiment = normalize_sentiment_0_1(payload.get("sentiment_score"), 0.5)
+    action = normalize_action_external(payload.get("action", "HOLD"))
 
     entry = round(safe_float(payload.get("entry"), s.close), 2)
     sl = round(safe_float(payload.get("sl"), s.close), 2)
@@ -835,6 +870,17 @@ def normalize_plan_payload(payload: Dict[str, Any], s: Snapshot) -> Plan:
         if name and rs:
             proposal = {"skill_name": name[:80], "reason": rs[:300]}
 
+    normalized_payload = {
+        "sentiment_score": sentiment,
+        "action": action,
+        "entry": entry,
+        "sl": sl,
+        "tp": tp,
+        "reason": reason,
+        "new_skill_proposal": proposal,
+        "reflection_one_liner": reflection,
+    }
+
     return Plan(
         sentiment_score=sentiment,
         reflection_one_liner=reflection,
@@ -843,7 +889,7 @@ def normalize_plan_payload(payload: Dict[str, Any], s: Snapshot) -> Plan:
         sl=sl,
         tp=tp,
         reason=reason,
-        raw=json.dumps(payload, ensure_ascii=False),
+        raw=json.dumps(normalized_payload, ensure_ascii=False),
         new_skill_proposal=proposal,
     )
 
@@ -858,9 +904,9 @@ def step3_openai_arbitrate(s: Snapshot, groq_norm: Dict[str, Any], gemini_payloa
         vol = str(groq_norm.get("volatility_flag", "normal"))
 
         # deterministic risk arbitration while preserving same output schema
-        if p.action == "LONG" and (risk_level >= 9 or vol == "high") and p.sentiment_score < 55:
+        if p.action == "BUY" and (risk_level >= 9 or vol == "high") and p.sentiment_score < 0.55:
             p.action = "HOLD"
-        if p.action == "SHORT" and (risk_level >= 9 or vol == "high") and p.sentiment_score > 45:
+        if p.action == "SELL" and (risk_level >= 9 or vol == "high") and p.sentiment_score > 0.45:
             p.action = "HOLD"
 
         if p.action == "HOLD":
@@ -890,9 +936,14 @@ def step3_openai_arbitrate(s: Snapshot, groq_norm: Dict[str, Any], gemini_payloa
         return fallback("missing OPENAI_API_KEY" if not key else "missing requests dependency")
 
     system_prompt = (
-        "You are the final risk arbitrator. Return strict JSON with keys: "
-        "sentiment_score, reflection_one_liner, action, entry, sl, tp, reason, new_skill_proposal. "
-        "Keep schema stable."
+        "You are the final risk arbitrator and must act as a Dow 20-year Wall Street quant strategist. "
+        "Return strict JSON only with keys: sentiment_score(0~1), reflection_one_liner, action(BUY/SELL/HOLD), "
+        "entry, sl, tp, reason, new_skill_proposal(null or {skill_name,reason}). "
+        "Enforce strategy constraints: 15m price action(candle_body/wick_ratio/integer-level false break-retest), "
+        "mean-reversion priority when bias_ema50 is too large, shrinking candle_body breakout clue, trend filter "
+        "(EMA20>EMA50 and upward slope => long bias only), range regime(RSI 30~70 => buy low sell high), "
+        "win-rate first with RR>1.5, and force market-regime-switch review after consecutive losses. "
+        "Always consider whether component-weight/VIX context should be proposed in new_skill_proposal."
     )
     user_prompt = (
         f"Groq normalized risk: {json.dumps(groq_norm, ensure_ascii=False)}\n"
@@ -940,7 +991,9 @@ def has_open_trade(conn: sqlite3.Connection) -> bool:
 def maybe_open_trade(conn: sqlite3.Connection, p: Plan) -> bool:
     if has_open_trade(conn):
         return False
-    if p.action not in {"LONG", "SHORT"}:
+
+    side = external_to_internal_side(p.action)
+    if side not in {"LONG", "SHORT"}:
         return False
 
     conn.execute(
@@ -950,7 +1003,7 @@ def maybe_open_trade(conn: sqlite3.Connection, p: Plan) -> bool:
             ai_reflection, ai_plan_raw
         ) VALUES (?, ?, ?, ?, ?, ?, ?, 'OPEN', ?, ?)
         """,
-        (SYMBOL, now_iso(), p.action, p.entry, p.sl, p.tp, p.reason, p.reflection_one_liner, p.raw),
+        (SYMBOL, now_iso(), side, p.entry, p.sl, p.tp, p.reason, p.reflection_one_liner, p.raw),
     )
     conn.commit()
     return True
@@ -1141,7 +1194,7 @@ def main() -> int:
     trend = trend_summary(s)
     tg_state = send_telegram(telegram_summary(winrate, plan.reflection_one_liner, trend, plan, monthly_progress))
 
-    expected_profit_points = plan.tp - plan.entry if plan.action != "SHORT" else plan.entry - plan.tp
+    expected_profit_points = plan.tp - plan.entry if plan.action != "SELL" else plan.entry - plan.tp
     optimization_suggestion = str(gemini_result.get("raw_json", {}).get("optimization_suggestion", "")).strip()
     if not optimization_suggestion:
         if force_goal_optimization:
