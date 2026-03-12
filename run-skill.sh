@@ -19,6 +19,7 @@ Examples:
   ./run-skill.sh trade-analyst
   ./run-skill.sh ai-orchestrator
   ./run-skill.sh report-generator
+  ./run-skill.sh backtest-engine --days 7
 EOF
 }
 

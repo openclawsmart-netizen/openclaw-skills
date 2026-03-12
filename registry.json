@@ -30,5 +30,9 @@
   "report-generator": {
     "description": "Generate Excel report from data/trade_logs.json and auto-send to Telegram (graceful skip if env missing)",
     "command": "python3 scripts/json_to_excel.py"
+  },
+  "backtest-engine": {
+    "description": "Run lightweight local-rule backtest over yfinance CSV/history",
+    "command": "python3 scripts/backtest_engine.py"
   }
 }

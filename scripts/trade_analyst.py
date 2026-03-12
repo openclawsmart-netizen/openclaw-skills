@@ -16,6 +16,7 @@ Unified persistence:
 
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import sqlite3
@@ -48,6 +49,9 @@ TELEGRAM_SCRIPT = BASE_DIR / "proactive-agent" / "send_telegram.py"
 GROQ_MODEL = (os.getenv("GROQ_MODEL") or "llama-3.1-8b-instant").strip()
 GEMINI_MODEL = (os.getenv("GEMINI_MODEL") or "gemini-2.0-flash").strip()
 OPENAI_MODEL = (os.getenv("OPENAI_MODEL") or "gpt-4o-mini").strip()
+
+CIRCUIT_BREAKER_DAILY_LOSS_LIMIT = -150.0
+CIRCUIT_BREAKER_MAX_LOSS_STREAK = 3
 
 
 @dataclass
@@ -462,6 +466,142 @@ def settle_open_trades(conn: sqlite3.Connection, price: float) -> int:
 
     conn.commit()
     return closed
+
+
+def ensure_risk_tables(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS risk_daily_stats (
+            trade_date TEXT PRIMARY KEY,
+            cumulative_pnl REAL NOT NULL DEFAULT 0,
+            losing_streak INTEGER NOT NULL DEFAULT 0,
+            updated_at TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS risk_state (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            circuit_breaker_active INTEGER NOT NULL DEFAULT 0,
+            breaker_reason TEXT,
+            triggered_at TEXT,
+            active_date TEXT,
+            updated_at TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO risk_state (id, circuit_breaker_active, breaker_reason, triggered_at, active_date, updated_at)
+        VALUES (1, 0, '', NULL, '', ?)
+        """,
+        (now_iso(),),
+    )
+    conn.commit()
+
+
+def get_taipei_date_str(ts: Any) -> Optional[str]:
+    dt = _parse_db_ts_to_taipei(ts)
+    if dt is None:
+        return None
+    return dt.strftime("%Y-%m-%d")
+
+
+def compute_daily_pnl_and_losing_streak(conn: sqlite3.Connection, date_str: str) -> Tuple[float, int]:
+    rows = conn.execute(
+        """
+        SELECT closed_at, pnl, status
+        FROM trades
+        WHERE status IN ('WIN','LOSS','CLOSED') AND closed_at IS NOT NULL
+        ORDER BY datetime(closed_at) DESC, id DESC
+        """
+    ).fetchall()
+
+    daily_pnl = 0.0
+    for closed_at, pnl, _ in rows:
+        if get_taipei_date_str(closed_at) == date_str:
+            daily_pnl += safe_float(pnl, 0.0)
+
+    streak = 0
+    for closed_at, pnl, status in rows:
+        if get_taipei_date_str(closed_at) != date_str:
+            continue
+        st_u = str(status or "").upper()
+        pnl_v = safe_float(pnl, 0.0)
+        is_loss = st_u == "LOSS" or (st_u == "CLOSED" and pnl_v < 0)
+        if is_loss:
+            streak += 1
+        else:
+            break
+
+    return float(daily_pnl), int(streak)
+
+
+def upsert_risk_daily_stats(conn: sqlite3.Connection, date_str: str, cumulative_pnl: float, losing_streak: int) -> None:
+    conn.execute(
+        """
+        INSERT INTO risk_daily_stats (trade_date, cumulative_pnl, losing_streak, updated_at)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(trade_date) DO UPDATE SET
+            cumulative_pnl=excluded.cumulative_pnl,
+            losing_streak=excluded.losing_streak,
+            updated_at=excluded.updated_at
+        """,
+        (date_str, float(cumulative_pnl), int(losing_streak), now_iso()),
+    )
+    conn.commit()
+
+
+def get_circuit_breaker_state(conn: sqlite3.Connection) -> Dict[str, Any]:
+    row = conn.execute(
+        "SELECT circuit_breaker_active, breaker_reason, triggered_at, active_date FROM risk_state WHERE id=1"
+    ).fetchone()
+    if not row:
+        return {"active": False, "reason": "", "triggered_at": None, "active_date": ""}
+    active, reason, triggered_at, active_date = row
+    return {
+        "active": bool(active),
+        "reason": str(reason or ""),
+        "triggered_at": triggered_at,
+        "active_date": str(active_date or ""),
+    }
+
+
+def set_circuit_breaker_state(
+    conn: sqlite3.Connection,
+    *,
+    active: bool,
+    reason: str,
+    active_date: str,
+    triggered_at: Optional[str] = None,
+) -> None:
+    conn.execute(
+        """
+        UPDATE risk_state
+        SET circuit_breaker_active=?, breaker_reason=?, triggered_at=?, active_date=?, updated_at=?
+        WHERE id=1
+        """,
+        (1 if active else 0, reason, triggered_at, active_date, now_iso()),
+    )
+    conn.commit()
+
+
+def evaluate_circuit_breaker(cumulative_pnl: float, losing_streak: int) -> Optional[str]:
+    reasons = []
+    if cumulative_pnl <= CIRCUIT_BREAKER_DAILY_LOSS_LIMIT:
+        reasons.append(f"當日累計損益 {cumulative_pnl:.2f} 點 <= {CIRCUIT_BREAKER_DAILY_LOSS_LIMIT:.0f} 點")
+    if losing_streak >= CIRCUIT_BREAKER_MAX_LOSS_STREAK:
+        reasons.append(f"連續虧損 {losing_streak} 筆 >= {CIRCUIT_BREAKER_MAX_LOSS_STREAK} 筆")
+    if not reasons:
+        return None
+    return "；".join(reasons)
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="YM=F trade analyst")
+    parser.add_argument("--reset-circuit-breaker", action="store_true", help="手動解除風控斷路器")
+    return parser.parse_args()
 
 
 def get_reflection(conn: sqlite3.Connection) -> Tuple[float, List[str], str]:
@@ -988,7 +1128,10 @@ def has_open_trade(conn: sqlite3.Connection) -> bool:
     return row is not None
 
 
-def maybe_open_trade(conn: sqlite3.Connection, p: Plan) -> bool:
+def maybe_open_trade(conn: sqlite3.Connection, p: Plan, readonly_mode: bool = False) -> bool:
+    if readonly_mode:
+        return False
+
     if has_open_trade(conn):
         return False
 
@@ -1136,6 +1279,7 @@ def append_trade_log_and_export_csv(record: Dict[str, Any]) -> Tuple[int, str, s
 
 
 def main() -> int:
+    args = parse_args()
     if (os.getenv("TRADE_ANALYST_TIME_GUARD_SELFTEST") or "").strip() == "1":
         _run_time_guard_selftest()
         print("[info] Time guard selftest passed")
@@ -1165,8 +1309,43 @@ def main() -> int:
     conn = sqlite3.connect(DB_PATH)
     try:
         ensure_db(conn)
+        ensure_risk_tables(conn)
+
+        today_tpe = now_tpe.strftime("%Y-%m-%d")
+        cb_state = get_circuit_breaker_state(conn)
+        manual_reset_done = False
+
+        if args.reset_circuit_breaker:
+            set_circuit_breaker_state(conn, active=False, reason="manual_reset", active_date=today_tpe, triggered_at=None)
+            manual_reset_done = True
+            send_telegram("🟢 [風控解除] 已手動解除 CIRCUIT_BREAKER，恢復可開倉模式。")
+            cb_state = get_circuit_breaker_state(conn)
+
+        if cb_state.get("active") and cb_state.get("active_date") != today_tpe:
+            set_circuit_breaker_state(conn, active=False, reason="auto_daily_reset", active_date=today_tpe, triggered_at=None)
+            send_telegram("🟢 [風控重置] CIRCUIT_BREAKER 已於新交易日自動重置，恢復可開倉模式。")
+            cb_state = get_circuit_breaker_state(conn)
+
         closed = settle_open_trades(conn, s.close)
         winrate, _, history_summary = get_reflection(conn)
+
+        daily_pnl, losing_streak = compute_daily_pnl_and_losing_streak(conn, today_tpe)
+        upsert_risk_daily_stats(conn, today_tpe, daily_pnl, losing_streak)
+
+        trigger_reason = evaluate_circuit_breaker(daily_pnl, losing_streak)
+        if trigger_reason and not cb_state.get("active"):
+            set_circuit_breaker_state(
+                conn,
+                active=True,
+                reason=trigger_reason,
+                active_date=today_tpe,
+                triggered_at=now_iso(),
+            )
+            send_telegram(
+                "🛑 [緊急停手] CIRCUIT_BREAKER 已啟動，立即停止新開倉/下單，僅允許監控、結算與報告。\n"
+                f"觸發條件：{trigger_reason}"
+            )
+            cb_state = get_circuit_breaker_state(conn)
 
         monthly_progress = get_monthly_progress(conn, now_tpe)
         recent_stats = get_recent_closed_stats(conn, STABLE_WINRATE_LOOKBACK)
@@ -1187,7 +1366,9 @@ def main() -> int:
         plan, openai_result = step3_openai_arbitrate(s, groq_result.get("normalized", {}), gemini_result.get("raw_json", {}))
 
         prior_trade_status = get_prior_trade_status(conn, s.close)
-        opened = maybe_open_trade(conn, plan)
+        readonly_mode = bool(get_circuit_breaker_state(conn).get("active"))
+        opened = maybe_open_trade(conn, plan, readonly_mode=readonly_mode)
+        cb_state = get_circuit_breaker_state(conn)
     finally:
         conn.close()
 
@@ -1223,6 +1404,14 @@ def main() -> int:
             "remaining": monthly_progress.remaining,
             "achievement_pct": monthly_progress.achievement_pct,
         },
+        "risk_control": {
+            "daily_pnl": daily_pnl,
+            "losing_streak": losing_streak,
+            "circuit_breaker_active": cb_state.get("active"),
+            "circuit_breaker_reason": cb_state.get("reason"),
+            "circuit_breaker_active_date": cb_state.get("active_date"),
+            "manual_reset_done": manual_reset_done,
+        },
         "strategy_mode": {
             "mode": mode_ctx.mode,
             "context": mode_ctx.context,
@@ -1256,7 +1445,8 @@ def main() -> int:
     print(f"[info] Groq risk: {json.dumps(groq_result.get('normalized', {}), ensure_ascii=False)}")
     print(f"[info] Plan: sentiment_score={plan.sentiment_score} action={plan.action} entry={plan.entry:.2f} sl={plan.sl:.2f} tp={plan.tp:.2f}")
     print(f"[info] new_skill_proposal={json.dumps(plan.new_skill_proposal, ensure_ascii=False)}")
-    print(f"[info] Trades: settled_open={closed}, opened_new={opened}")
+    print(f"[info] Risk: daily_pnl={daily_pnl:.2f} losing_streak={losing_streak} circuit_breaker_active={cb_state.get('active')} reason={cb_state.get('reason')}")
+    print(f"[info] Trades: settled_open={closed}, opened_new={opened} readonly_mode={cb_state.get('active')}")
     print(f"[info] Log export: records={log_count} json={json_path} csv={csv_path}")
     print(f"[info] Telegram: {tg_state}")
     return 0
