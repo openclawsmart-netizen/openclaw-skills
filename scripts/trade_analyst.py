@@ -25,6 +25,13 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+
+MONTHLY_TARGET_POINTS = 1000.0
+# 達成率 >= 90% 視為接近目標，切換防守模式
+DEFENSIVE_PROGRESS_THRESHOLD = 90.0
+# 近期勝率穩定門檻：最近 N 筆已平倉，勝率 >= 55%
+STABLE_WINRATE_LOOKBACK = 8
+STABLE_WINRATE_THRESHOLD = 55.0
 from zoneinfo import ZoneInfo
 
 SYMBOL = "YM=F"
@@ -70,6 +77,19 @@ class Plan:
     reason: str
     raw: str
     new_skill_proposal: Optional[Dict[str, str]] = None
+
+
+@dataclass
+class MonthlyProgress:
+    current_pnl: float
+    remaining: float
+    achievement_pct: float
+
+
+@dataclass
+class StrategyModeContext:
+    mode: str
+    context: str
 
 
 def eprint(msg: str) -> None:
@@ -444,6 +464,130 @@ def get_reflection(conn: sqlite3.Connection) -> Tuple[float, List[str], str]:
     return winrate, items, summary
 
 
+def _parse_db_ts_to_taipei(ts: Any) -> Optional[datetime]:
+    if not ts:
+        return None
+    s = str(ts).strip()
+    if not s:
+        return None
+    try:
+        dt = datetime.fromisoformat(s)
+    except Exception:
+        return None
+    tz_tpe = ZoneInfo("Asia/Taipei")
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc).astimezone(tz_tpe)
+    return dt.astimezone(tz_tpe)
+
+
+def get_monthly_progress(conn: sqlite3.Connection, now_tpe: datetime) -> MonthlyProgress:
+    rows = conn.execute(
+        """
+        SELECT closed_at, pnl
+        FROM trades
+        WHERE status IN ('WIN','LOSS','CLOSED') AND closed_at IS NOT NULL
+        """
+    ).fetchall()
+
+    month_start = now_tpe.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    if now_tpe.month == 12:
+        month_end = now_tpe.replace(year=now_tpe.year + 1, month=1, day=1, hour=0, minute=0, second=0, microsecond=0)
+    else:
+        month_end = now_tpe.replace(month=now_tpe.month + 1, day=1, hour=0, minute=0, second=0, microsecond=0)
+
+    current_pnl = 0.0
+    for closed_at, pnl in rows:
+        dt_tpe = _parse_db_ts_to_taipei(closed_at)
+        if dt_tpe is None:
+            continue
+        if month_start <= dt_tpe < month_end:
+            current_pnl += safe_float(pnl, 0.0)
+
+    achievement_pct = (current_pnl / MONTHLY_TARGET_POINTS * 100.0) if MONTHLY_TARGET_POINTS else 0.0
+    remaining = MONTHLY_TARGET_POINTS - current_pnl
+    return MonthlyProgress(current_pnl=float(current_pnl), remaining=float(remaining), achievement_pct=float(achievement_pct))
+
+
+def get_recent_closed_stats(conn: sqlite3.Connection, lookback: int = STABLE_WINRATE_LOOKBACK) -> Dict[str, Any]:
+    rows = conn.execute(
+        """
+        SELECT status, pnl
+        FROM trades
+        WHERE status IN ('WIN','LOSS','CLOSED') AND closed_at IS NOT NULL
+        ORDER BY datetime(closed_at) DESC
+        LIMIT ?
+        """,
+        (int(max(1, lookback)),),
+    ).fetchall()
+
+    if not rows:
+        return {"count": 0, "winrate": 0.0, "stable": False}
+
+    wins = 0
+    for st, pnl in rows:
+        st_u = str(st or "").upper()
+        pnl_v = safe_float(pnl, 0.0)
+        if st_u == "WIN" or (st_u == "CLOSED" and pnl_v > 0):
+            wins += 1
+
+    count = len(rows)
+    winrate = (wins / count) * 100.0 if count else 0.0
+    stable = count >= min(lookback, 3) and winrate >= STABLE_WINRATE_THRESHOLD
+    return {"count": count, "winrate": float(winrate), "stable": bool(stable)}
+
+
+def recent_three_closed_all_loss(conn: sqlite3.Connection) -> bool:
+    rows = conn.execute(
+        """
+        SELECT status, pnl
+        FROM trades
+        WHERE status IN ('WIN','LOSS','CLOSED') AND closed_at IS NOT NULL
+        ORDER BY datetime(closed_at) DESC
+        LIMIT 3
+        """
+    ).fetchall()
+
+    if len(rows) < 3:
+        return False
+
+    for st, pnl in rows:
+        st_u = str(st or "").upper()
+        pnl_v = safe_float(pnl, 0.0)
+        is_loss = st_u == "LOSS" or (st_u == "CLOSED" and pnl_v < 0)
+        if not is_loss:
+            return False
+    return True
+
+
+def build_strategy_mode_context(monthly: MonthlyProgress, recent_stats: Dict[str, Any]) -> StrategyModeContext:
+    stable = bool(recent_stats.get("stable", False))
+
+    # 防守模式：已達標或接近達標（>=90%）
+    if monthly.current_pnl >= MONTHLY_TARGET_POINTS or monthly.achievement_pct >= DEFENSIVE_PROGRESS_THRESHOLD:
+        return StrategyModeContext(
+            mode="Defensive",
+            context=(
+                "月目標已達成或接近，請優先風險過濾與鎖利，避免回吐；"
+                "若訊號品質不足，傾向 HOLD。"
+            ),
+        )
+
+    # 進攻模式：進度仍落後，但近期勝率穩定
+    if monthly.achievement_pct < DEFENSIVE_PROGRESS_THRESHOLD and stable:
+        return StrategyModeContext(
+            mode="Aggressive",
+            context=(
+                "月目標進度落後但近期勝率穩定，可稍微放寬進場條件以捕捉更多波動；"
+                "仍需維持合理停損紀律。"
+            ),
+        )
+
+    return StrategyModeContext(
+        mode="Balanced",
+        context="在風險與機會間維持中性配置，依訊號品質決定 LONG/SHORT/HOLD。",
+    )
+
+
 def trend_summary(s: Snapshot) -> str:
     trend = "震盪"
     if s.close > s.ema20 > s.ema50:
@@ -493,7 +637,7 @@ def normalize_risk(parsed: Dict[str, Any], s: Snapshot, degraded: bool = False) 
     }
 
 
-def step1_groq_risk_check(s: Snapshot) -> Dict[str, Any]:
+def step1_groq_risk_check(s: Snapshot, mode_ctx: StrategyModeContext, monthly: MonthlyProgress) -> Dict[str, Any]:
     key = (os.getenv("GROQ_API_KEY") or "").strip()
     requests = _get_requests_module()
 
@@ -511,6 +655,9 @@ def step1_groq_risk_check(s: Snapshot) -> Dict[str, Any]:
         "You are a futures risk sentinel. Output strict JSON only. "
         "Required keys: risk_level(0-10 int), volatility_flag(high/normal). "
         "Optional: risk_notes(array).\n"
+        "If mode is Defensive, strengthen risk filters and profit-protection to avoid giving back gains.\n"
+        f"Mode: {mode_ctx.mode}, Context: {mode_ctx.context}\n"
+        f"MonthlyProgress: current_pnl={monthly.current_pnl:.2f}, target={MONTHLY_TARGET_POINTS:.0f}, achievement_pct={monthly.achievement_pct:.2f}, remaining={monthly.remaining:.2f}\n"
         f"Snapshot: {json.dumps(s.__dict__, ensure_ascii=False)}"
     )
     payload = {
@@ -547,7 +694,15 @@ def step1_groq_risk_check(s: Snapshot) -> Dict[str, Any]:
         return {"status": "fallback", "reason": f"Groq exception: {exc}", "raw_json": fallback, "normalized": normalize_risk(fallback, s, True)}
 
 
-def step2_gemini_strategy(s: Snapshot, winrate: float, history_summary: str, groq_norm: Dict[str, Any]) -> Dict[str, Any]:
+def step2_gemini_strategy(
+    s: Snapshot,
+    winrate: float,
+    history_summary: str,
+    groq_norm: Dict[str, Any],
+    monthly: MonthlyProgress,
+    mode_ctx: StrategyModeContext,
+    force_goal_optimization: bool,
+) -> Dict[str, Any]:
     key = (os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY") or "").strip()
     requests = _get_requests_module()
 
@@ -589,6 +744,13 @@ def step2_gemini_strategy(s: Snapshot, winrate: float, history_summary: str, gro
                 "reason": "近期勝率偏低，建議加入 VIX/新聞情緒作為濾網以降低假突破。",
             }
 
+        optimization_text = (
+            "連三虧後先縮減可交易情境：僅在 EMA20/EMA50 同向且 MACD 同向時進場，"
+            "停損縮至原先 0.8 倍、單筆報酬風險比需 >=1.8；"
+            "若本月距 1000 點仍落後，改採分批出場先鎖 50% 利潤，避免再次回吐。"
+            if force_goal_optimization
+            else "依近期勝率動態調整進場過濾條件與停損帶寬。"
+        )
         payload = {
             "sentiment_score": int(clamp(score, 0, 100)),
             "reflection_one_liner": "Gemini fallback：已整合風險哨兵與微觀特徵進行保守決策。",
@@ -596,7 +758,11 @@ def step2_gemini_strategy(s: Snapshot, winrate: float, history_summary: str, gro
             "entry": round(s.close, 2),
             "sl": round(sl, 2),
             "tp": round(tp, 2),
-            "reason": f"fallback_strategy(reason={reason}, risk_level={risk_level}, volatility={vol_flag}, history={history_summary})",
+            "reason": (
+                f"fallback_strategy(reason={reason}, risk_level={risk_level}, volatility={vol_flag}, "
+                f"mode={mode_ctx.mode}, achievement={monthly.achievement_pct:.2f}%, history={history_summary})"
+            ),
+            "optimization_suggestion": optimization_text,
             "new_skill_proposal": proposal,
         }
         return {"status": "fallback", "reason": reason, "raw_json": payload}
@@ -604,10 +770,19 @@ def step2_gemini_strategy(s: Snapshot, winrate: float, history_summary: str, gro
     if not key or requests is None:
         return fallback("missing GEMINI_API_KEY/GOOGLE_API_KEY" if not key else "missing requests dependency")
 
+    optimization_requirement = (
+        "optimization_suggestion 欄位必填，且需針對『月獲利1000點目標』提供可執行修正方案（不得空白、不得泛談）。"
+        if force_goal_optimization
+        else "optimization_suggestion 欄位建議提供簡短優化方向。"
+    )
+
     prompt = (
         "你是 YM=F 15m 量化策略師。請只輸出 JSON。\n"
-        "必要欄位: sentiment_score(0-100 int), reflection_one_liner, action(LONG/SHORT/HOLD), entry, sl, tp, reason, new_skill_proposal(null或{skill_name,reason})。\n"
+        "必要欄位: sentiment_score(0-100 int), reflection_one_liner, action(LONG/SHORT/HOLD), entry, sl, tp, reason, optimization_suggestion, new_skill_proposal(null或{skill_name,reason})。\n"
         "你必須結合：K線+微觀特徵(candle_body/upper_wick_ratio/lower_wick_ratio/bias_ema20/bias_ema50)+Groq風險訊號。\n"
+        f"策略模式: mode={mode_ctx.mode}, context={mode_ctx.context}\n"
+        f"月目標進度: current_pnl={monthly.current_pnl:.2f}, target={MONTHLY_TARGET_POINTS:.0f}, achievement_pct={monthly.achievement_pct:.2f}, remaining={monthly.remaining:.2f}\n"
+        f"{optimization_requirement}\n"
         f"Groq normalized: {json.dumps(groq_norm, ensure_ascii=False)}\n"
         f"winrate={winrate:.1f}, history={history_summary}\n"
         f"snapshot={json.dumps(s.__dict__, ensure_ascii=False)}"
@@ -781,10 +956,11 @@ def maybe_open_trade(conn: sqlite3.Connection, p: Plan) -> bool:
     return True
 
 
-def telegram_summary(winrate: float, reflection: str, trend: str, p: Plan) -> str:
+def telegram_summary(winrate: float, reflection: str, trend: str, p: Plan, monthly: MonthlyProgress) -> str:
     msg = (
         "📊 道瓊期貨 AI 交易員 (15m)\n"
         f"🧠 自我檢討：{winrate:.1f}% - {reflection}\n"
+        f"📈 本月進度：{monthly.current_pnl:.2f} / {MONTHLY_TARGET_POINTS:.0f} 點 ({monthly.achievement_pct:.1f}%)\n"
         f"📈 當前盤勢：{trend}\n"
         f"🤖 最新計畫：{p.action} (Entry: {p.entry:.2f}, SL: {p.sl:.2f}, TP: {p.tp:.2f})"
     )
@@ -939,9 +1115,22 @@ def main() -> int:
         closed = settle_open_trades(conn, s.close)
         winrate, _, history_summary = get_reflection(conn)
 
+        monthly_progress = get_monthly_progress(conn, now_tpe)
+        recent_stats = get_recent_closed_stats(conn, STABLE_WINRATE_LOOKBACK)
+        mode_ctx = build_strategy_mode_context(monthly_progress, recent_stats)
+        force_goal_optimization = recent_three_closed_all_loss(conn)
+
         # Tri-brain orchestration
-        groq_result = step1_groq_risk_check(s)
-        gemini_result = step2_gemini_strategy(s, winrate, history_summary, groq_result.get("normalized", {}))
+        groq_result = step1_groq_risk_check(s, mode_ctx, monthly_progress)
+        gemini_result = step2_gemini_strategy(
+            s,
+            winrate,
+            history_summary,
+            groq_result.get("normalized", {}),
+            monthly_progress,
+            mode_ctx,
+            force_goal_optimization,
+        )
         plan, openai_result = step3_openai_arbitrate(s, groq_result.get("normalized", {}), gemini_result.get("raw_json", {}))
 
         prior_trade_status = get_prior_trade_status(conn, s.close)
@@ -950,9 +1139,20 @@ def main() -> int:
         conn.close()
 
     trend = trend_summary(s)
-    tg_state = send_telegram(telegram_summary(winrate, plan.reflection_one_liner, trend, plan))
+    tg_state = send_telegram(telegram_summary(winrate, plan.reflection_one_liner, trend, plan, monthly_progress))
 
     expected_profit_points = plan.tp - plan.entry if plan.action != "SHORT" else plan.entry - plan.tp
+    optimization_suggestion = str(gemini_result.get("raw_json", {}).get("optimization_suggestion", "")).strip()
+    if not optimization_suggestion:
+        if force_goal_optimization:
+            optimization_suggestion = (
+                "規則建議：連三虧後，接下來 3 筆交易僅允許趨勢同向訊號；"
+                "單筆風險降至平常 70%，達到 +0.8R 即移動停損保本，"
+                "並以『月獲利1000點』差距優先排序高品質機會，避免低勝率過度交易。"
+            )
+        else:
+            optimization_suggestion = "依近期勝率動態調整進場過濾條件與停損帶寬。"
+
     log_record: Dict[str, Any] = {
         "date": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "entry_price": float(plan.entry),
@@ -961,9 +1161,23 @@ def main() -> int:
         "expected_profit_points": float(expected_profit_points),
         "analysis_reasoning": str(plan.reason),
         "error_review": str(plan.reflection_one_liner),
-        "optimization_suggestion": "依近期勝率動態調整進場過濾條件與停損帶寬。",
+        "optimization_suggestion": optimization_suggestion,
         "new_skill_proposal": plan.new_skill_proposal,
         "prior_trade_status": prior_trade_status,
+        "monthly_progress": {
+            "target_points": MONTHLY_TARGET_POINTS,
+            "current_pnl": monthly_progress.current_pnl,
+            "remaining": monthly_progress.remaining,
+            "achievement_pct": monthly_progress.achievement_pct,
+        },
+        "strategy_mode": {
+            "mode": mode_ctx.mode,
+            "context": mode_ctx.context,
+            "recent_winrate": recent_stats.get("winrate"),
+            "recent_count": recent_stats.get("count"),
+            "recent_stable": recent_stats.get("stable"),
+            "force_goal_optimization": force_goal_optimization,
+        },
         "tri_brain_status": {
             "groq": {"status": groq_result.get("status"), "reason": groq_result.get("reason"), "normalized": groq_result.get("normalized")},
             "gemini": {"status": gemini_result.get("status"), "reason": gemini_result.get("reason")},
@@ -981,6 +1195,11 @@ def main() -> int:
         f"BiasEMA20={s.bias_ema20:.2f}% BiasEMA50={s.bias_ema50:.2f}%"
     )
     print(f"[info] Reflection winrate(last5)={winrate:.1f}%")
+    print(
+        f"[info] Monthly progress: pnl={monthly_progress.current_pnl:.2f}/{MONTHLY_TARGET_POINTS:.0f} "
+        f"achievement={monthly_progress.achievement_pct:.2f}% remaining={monthly_progress.remaining:.2f} "
+        f"mode={mode_ctx.mode} recent_winrate={safe_float(recent_stats.get('winrate'), 0.0):.1f}%"
+    )
     print(f"[info] Groq risk: {json.dumps(groq_result.get('normalized', {}), ensure_ascii=False)}")
     print(f"[info] Plan: sentiment_score={plan.sentiment_score} action={plan.action} entry={plan.entry:.2f} sl={plan.sl:.2f} tp={plan.tp:.2f}")
     print(f"[info] new_skill_proposal={json.dumps(plan.new_skill_proposal, ensure_ascii=False)}")
