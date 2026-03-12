@@ -13,7 +13,7 @@ from __future__ import annotations
 import json
 import threading
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
@@ -39,6 +39,9 @@ class DashboardApp:
         self.last_jobs: List[Dict[str, Any]] = []
         self.job_map: Dict[str, Dict[str, Any]] = {}
         self._refresh_running = False
+
+        self.selected_job_name: Optional[str] = None
+        self.checked_jobs: Set[str] = set()
 
         self._build_ui()
         self._set_status("初始化中... / Initializing...", error=False)
@@ -87,16 +90,25 @@ class DashboardApp:
         jobs_frame.columnconfigure(0, weight=1)
         jobs_frame.rowconfigure(0, weight=1)
 
-        cols = ("name", "description", "status", "last_run")
+        cols = ("pick", "name", "description", "status", "last_run")
         self.tree = ttk.Treeview(jobs_frame, columns=cols, show="headings", height=16)
+        self.tree.heading("pick", text="勾選 / Pick")
         self.tree.heading("name", text="名稱 / Name")
         self.tree.heading("description", text="說明 / Description")
         self.tree.heading("status", text="狀態 / Status")
         self.tree.heading("last_run", text="最後執行 / Last run")
-        self.tree.column("name", width=180, anchor="w")
-        self.tree.column("description", width=560, anchor="w")
-        self.tree.column("status", width=120, anchor="center")
+        self.tree.column("pick", width=90, anchor="center", stretch=False)
+        self.tree.column("name", width=170, anchor="w")
+        self.tree.column("description", width=520, anchor="w")
+        self.tree.column("status", width=130, anchor="center")
         self.tree.column("last_run", width=220, anchor="center")
+
+        self.tree.tag_configure("status-running", background="#143d1f", foreground="#d6ffd6")
+        self.tree.tag_configure("status-idle", background="#ffffff", foreground="#111111")
+        self.tree.tag_configure("status-error", background="#5a1010", foreground="#ffd7d7")
+
+        self.tree.bind("<<TreeviewSelect>>", self._on_tree_select)
+        self.tree.bind("<Button-1>", self._on_tree_click, add=True)
 
         vbar = ttk.Scrollbar(jobs_frame, orient="vertical", command=self.tree.yview)
         self.tree.configure(yscrollcommand=vbar.set)
@@ -171,11 +183,24 @@ class DashboardApp:
         self.updated_var.set("Updated: " + datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
         self._set_status("已同步 / Synced", error=False)
 
+    def _status_tag(self, status: str) -> str:
+        normalized = status.strip().lower()
+        if any(k in normalized for k in ("working", "running")):
+            return "status-running"
+        if any(k in normalized for k in ("error", "problem", "fallback", "circuit breaker", "circuit_breaker")):
+            return "status-error"
+        if any(k in normalized for k in ("idle", "disabled", "not running", "not_started", "stopped", "未執行")):
+            return "status-idle"
+        return "status-idle"
+
     def _render_jobs(self, jobs: List[Dict[str, Any]]) -> None:
         self.last_jobs = jobs
         self.job_map = {}
 
-        selected_name = self._get_selected_job_name()
+        previous_checked = set(self.checked_jobs)
+        available_names = {str(job.get("jobName", "")) for job in jobs}
+        self.checked_jobs = {name for name in previous_checked if name in available_names and name}
+
         for item in self.tree.get_children():
             self.tree.delete(item)
 
@@ -185,27 +210,59 @@ class DashboardApp:
             desc = str(job.get("description", ""))
             status = str(job.get("status", ""))
             last_run = str(job.get("lastRun", ""))
+            checked_mark = "[x]" if name in self.checked_jobs else "[ ]"
             iid = f"job-{idx}"
             self.job_map[iid] = job
-            self.tree.insert("", "end", iid=iid, values=(name, desc, status, last_run))
-            if selected_name and selected_name == name:
+            self.tree.insert("", "end", iid=iid, values=(checked_mark, name, desc, status, last_run), tags=(self._status_tag(status),))
+            if self.selected_job_name and self.selected_job_name == name:
                 selected_iid = iid
 
         if selected_iid:
             self.tree.selection_set(selected_iid)
+            self.tree.focus(selected_iid)
+
+    def _on_tree_select(self, _event: tk.Event) -> None:
+        self.selected_job_name = self._get_selected_job_name()
+
+    def _on_tree_click(self, event: tk.Event) -> Optional[str]:
+        row_id = self.tree.identify_row(event.y)
+        col_id = self.tree.identify_column(event.x)
+        if not row_id:
+            return None
+
+        item = self.job_map.get(row_id, {})
+        name = str(item.get("jobName", ""))
+
+        if col_id == "#1" and name:
+            if name in self.checked_jobs:
+                self.checked_jobs.remove(name)
+            else:
+                self.checked_jobs.add(name)
+            self._render_jobs(self.last_jobs)
+            self._set_status(f"已更新勾選 / Pick updated: {name}", error=False)
+            return "break"
+        return None
 
     def _get_selected_job_name(self) -> Optional[str]:
         sel = self.tree.selection()
         if not sel:
-            return None
+            return self.selected_job_name
         item = self.job_map.get(sel[0], {})
         name = item.get("jobName")
-        return str(name) if name else None
+        return str(name) if name else self.selected_job_name
+
+    def _resolve_target_job_name(self) -> Optional[str]:
+        if self.checked_jobs:
+            for job in self.last_jobs:
+                name = str(job.get("jobName", ""))
+                if name in self.checked_jobs:
+                    return name
+        return self._get_selected_job_name()
 
     def _on_job_action(self, action: str) -> None:
-        job_name = self._get_selected_job_name()
+        job_name = self._resolve_target_job_name()
         if not job_name:
-            messagebox.showwarning("未選擇工作 / No job selected", "請先選擇一個工作列。\nPlease select a job row first.")
+            messagebox.showwarning("未選擇工作 / No job selected", "請先勾選或點選一個工作。\nPlease check or select one job first.")
             return
 
         endpoint = f"/api/jobs/{action}"
@@ -279,6 +336,12 @@ def main() -> int:
     style = ttk.Style(root)
     try:
         style.theme_use("clam")
+    except Exception:
+        pass
+
+    # Keep selection highlight visible even when treeview loses focus.
+    try:
+        style.map("Treeview", background=[("selected", "#2a4d7a")], foreground=[("selected", "#ffffff")])
     except Exception:
         pass
 
