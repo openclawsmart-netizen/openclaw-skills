@@ -23,6 +23,10 @@
     "description": "Analyze YM=F 15m with technical indicators, run paper trades in SQLite, and send Telegram summary",
     "command": "python3 scripts/trade_analyst.py"
   },
+  "trade-apprentice": {
+    "description": "Run trade analyst in apprentice paper-learning mode (auto-tune bounded params + rollback)",
+    "command": "python3 scripts/trade_analyst.py --mode apprentice"
+  },
   "ai-orchestrator": {
     "description": "[DEPRECATED] Use trade-analyst instead (legacy shim only)",
     "command": "python3 scripts/ai_orchestrator.py"

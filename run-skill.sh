@@ -29,6 +29,7 @@ if [[ -z "$skill" ]]; then
   echo "Examples:" >&2
   echo "  $0 health-check" >&2
   echo "  $0 trade-analyst" >&2
+  echo "  $0 trade-apprentice" >&2
   echo "  $0 trade-health-check" >&2
   exit 2
 fi

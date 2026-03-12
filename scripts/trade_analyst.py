@@ -64,6 +64,12 @@ TRADE_LOG_CSV = DATA_DIR / "trade_logs.csv"
 TELEGRAM_SCRIPT = BASE_DIR / "proactive-agent" / "send_telegram.py"
 RUN_LOCK_PATH = DATA_DIR / "trade_analyst.lock"
 TELEGRAM_DEDUP_PATH = DATA_DIR / "telegram_dedup.json"
+APPRENTICE_JOURNAL_PATH = DATA_DIR / "apprentice_journal.json"
+
+DEFAULT_MODE = "standard"
+APPRENTICE_MODE = "apprentice"
+APPRENTICE_LOOKBACK = 20
+APPRENTICE_OBSERVE_WINDOW = 10
 
 GROQ_MODEL = (os.getenv("GROQ_MODEL") or "llama-3.1-8b-instant").strip()
 GEMINI_MODEL = (os.getenv("GEMINI_MODEL") or "gemini-2.0-flash").strip()
@@ -131,6 +137,18 @@ class RolloverDecision:
     reason: str
     adjustment_method: str
 
+
+
+
+@dataclass
+class ApprenticeStatus:
+    mode: str
+    enabled: bool
+    params: Dict[str, float]
+    adjusted: bool
+    rollback: bool
+    recent_winrate: float
+    notes: List[str]
 
 def eprint(msg: str) -> None:
     print(msg, file=sys.stderr)
@@ -984,6 +1002,7 @@ def build_consultant_routing(
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="YM=F trade analyst")
     parser.add_argument("--reset-circuit-breaker", action="store_true", help="手動解除風控斷路器")
+    parser.add_argument("--mode", default=DEFAULT_MODE, choices=[DEFAULT_MODE, APPRENTICE_MODE], help="策略模式：standard 或 apprentice")
     return parser.parse_args()
 
 
@@ -1699,6 +1718,7 @@ def telegram_summary(
     rollover_status: str,
     consultant_tags: Optional[List[str]] = None,
     quota_degraded: bool = False,
+    apprentice: Optional[ApprenticeStatus] = None,
 ) -> str:
     msg = (
         "📊 道瓊期貨 AI 交易員 (15m)\n"
@@ -1710,6 +1730,12 @@ def telegram_summary(
     )
     if quota_degraded:
         msg += "\n⚠️ 本次因配額降級：Gemini 不可用，已自動改走 Groq + 規則引擎。"
+    if apprentice and apprentice.enabled:
+        msg += (
+            "\n🧪 Apprentice："
+            f"winrate={apprentice.recent_winrate:.1f}% | adjusted={'Y' if apprentice.adjusted else 'N'} | rollback={'Y' if apprentice.rollback else 'N'}"
+            f"\n   params={json.dumps(apprentice.params, ensure_ascii=False)}"
+        )
     if p.new_skill_proposal:
         msg += (
             "\n🧪 [研發提案]\n"
@@ -1875,6 +1901,233 @@ def append_trade_log_and_export_csv(record: Dict[str, Any]) -> Tuple[int, str, s
     return len(records), str(TRADE_LOG_JSON), str(TRADE_LOG_CSV)
 
 
+def _load_apprentice_journal() -> List[Dict[str, Any]]:
+    if not APPRENTICE_JOURNAL_PATH.exists():
+        return []
+    try:
+        data = json.loads(APPRENTICE_JOURNAL_PATH.read_text(encoding="utf-8"))
+        return data if isinstance(data, list) else []
+    except Exception:
+        return []
+
+
+def _save_apprentice_journal(entries: List[Dict[str, Any]]) -> None:
+    APPRENTICE_JOURNAL_PATH.parent.mkdir(parents=True, exist_ok=True)
+    APPRENTICE_JOURNAL_PATH.write_text(json.dumps(entries, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _default_apprentice_params() -> Dict[str, float]:
+    return {
+        "rsi_buy_threshold": 35.0,
+        "rsi_sell_threshold": 65.0,
+        "rr_min": 1.6,
+        "max_hold_minutes": 240.0,
+        "risk_pct": 0.7,
+    }
+
+
+def _apprentice_param_spec() -> Dict[str, Tuple[float, float, float]]:
+    return {
+        "rsi_buy_threshold": (28.0, 45.0, 1.0),
+        "rsi_sell_threshold": (55.0, 72.0, 1.0),
+        "rr_min": (1.3, 2.2, 0.1),
+        "max_hold_minutes": (90.0, 480.0, 30.0),
+        "risk_pct": (0.3, 1.2, 0.1),
+    }
+
+
+def _bounded_step(params: Dict[str, float], name: str, direction: int) -> None:
+    lo, hi, step = _apprentice_param_spec()[name]
+    next_v = params[name] + step * (1 if direction > 0 else -1)
+    params[name] = round(clamp(next_v, lo, hi), 4)
+
+
+def _extract_apprentice_features(conn: sqlite3.Connection, lookback: int) -> Dict[str, Any]:
+    rows = conn.execute(
+        """
+        SELECT opened_at, closed_at, status, pnl, reason, ai_plan_raw, entry_price, sl, tp
+        FROM trades
+        WHERE status IN ('WIN','LOSS','CLOSED') AND closed_at IS NOT NULL
+        ORDER BY datetime(closed_at) DESC
+        LIMIT ?
+        """,
+        (int(max(3, lookback)),),
+    ).fetchall()
+    if not rows:
+        return {"count": 0, "winrate": 0.0, "losses": 0, "avg_hold_minutes": 0.0, "rr_hit_rate": 0.0, "entry_conditions": []}
+
+    wins = 0
+    losses = 0
+    rr_hits = 0
+    hold_mins: List[float] = []
+    keywords = {"breakout": 0, "retest": 0, "mean-reversion": 0, "trend": 0, "rsi": 0}
+
+    for opened_at, closed_at, status, pnl, reason, _, entry, sl, tp in rows:
+        pnl_v = safe_float(pnl, 0.0)
+        st_u = str(status or "").upper()
+        is_win = st_u == "WIN" or (st_u == "CLOSED" and pnl_v > 0)
+        if is_win:
+            wins += 1
+        else:
+            losses += 1
+
+        risk = abs(safe_float(entry, 0.0) - safe_float(sl, 0.0))
+        reward = abs(safe_float(tp, 0.0) - safe_float(entry, 0.0))
+        rr = (reward / risk) if risk > 0 else 0.0
+        if is_win and rr >= 1.5:
+            rr_hits += 1
+
+        op = _parse_iso_utc(opened_at)
+        cl = _parse_iso_utc(closed_at)
+        if op and cl and cl >= op:
+            hold_mins.append((cl - op).total_seconds() / 60.0)
+
+        reason_l = str(reason or "").lower()
+        for k in keywords:
+            if k in reason_l:
+                keywords[k] += 1
+
+    count = len(rows)
+    winrate = wins / count * 100.0
+    top_conditions = [k for k, _ in sorted(keywords.items(), key=lambda x: x[1], reverse=True) if _ > 0][:3]
+    return {
+        "count": count,
+        "winrate": float(winrate),
+        "losses": losses,
+        "avg_hold_minutes": float(sum(hold_mins) / len(hold_mins)) if hold_mins else 0.0,
+        "rr_hit_rate": float(rr_hits / count * 100.0),
+        "entry_conditions": top_conditions,
+    }
+
+
+def _apprentice_prev_params(journal: List[Dict[str, Any]]) -> Dict[str, float]:
+    if not journal:
+        return _default_apprentice_params()
+    for item in reversed(journal):
+        p = item.get("after_params")
+        if isinstance(p, dict) and p:
+            merged = _default_apprentice_params()
+            for k in merged.keys():
+                merged[k] = safe_float(p.get(k), merged[k])
+            return merged
+    return _default_apprentice_params()
+
+
+def derive_apprentice_status(conn: sqlite3.Connection, mode: str) -> ApprenticeStatus:
+    enabled = mode == APPRENTICE_MODE
+    base = _default_apprentice_params()
+    if not enabled:
+        return ApprenticeStatus(mode=mode, enabled=False, params=base, adjusted=False, rollback=False, recent_winrate=0.0, notes=["standard_mode"])
+
+    journal = _load_apprentice_journal()
+    before = _apprentice_prev_params(journal)
+    after = dict(before)
+    features = _extract_apprentice_features(conn, APPRENTICE_LOOKBACK)
+    notes: List[str] = []
+    adjusted = False
+    rollback = False
+
+    recent = conn.execute(
+        """
+        SELECT status, pnl FROM trades
+        WHERE status IN ('WIN','LOSS','CLOSED') AND closed_at IS NOT NULL
+        ORDER BY datetime(closed_at) DESC LIMIT ?
+        """,
+        (APPRENTICE_OBSERVE_WINDOW * 2,),
+    ).fetchall()
+    if len(recent) >= APPRENTICE_OBSERVE_WINDOW * 2:
+        curr = recent[:APPRENTICE_OBSERVE_WINDOW]
+        prev = recent[APPRENTICE_OBSERVE_WINDOW:APPRENTICE_OBSERVE_WINDOW * 2]
+        def wr(seg):
+            w = 0
+            for st, pnl in seg:
+                p = safe_float(pnl, 0.0)
+                su = str(st or "").upper()
+                if su == "WIN" or (su == "CLOSED" and p > 0):
+                    w += 1
+            return w / len(seg) * 100.0
+        w_curr, w_prev = wr(curr), wr(prev)
+        if w_prev - w_curr >= 12 and len(journal) >= 2:
+            rollback = True
+            rollback_to = journal[-2].get("after_params") if isinstance(journal[-2], dict) else None
+            if isinstance(rollback_to, dict):
+                for k in after.keys():
+                    after[k] = safe_float(rollback_to.get(k), after[k])
+            notes.append(f"performance_drop rollback {w_prev:.1f}%->{w_curr:.1f}%")
+
+    if not rollback and features.get("count", 0) >= 6:
+        wr = safe_float(features.get("winrate"), 0.0)
+        rr_hit = safe_float(features.get("rr_hit_rate"), 0.0)
+        avg_hold = safe_float(features.get("avg_hold_minutes"), 0.0)
+        if wr < 45:
+            _bounded_step(after, "rsi_buy_threshold", -1)
+            _bounded_step(after, "rsi_sell_threshold", +1)
+            _bounded_step(after, "risk_pct", -1)
+            adjusted = True
+            notes.append("low_winrate tighten risk + wider RSI filter")
+        if rr_hit < 35:
+            _bounded_step(after, "rr_min", +1)
+            adjusted = True
+            notes.append("rr_hit_low raise rr_min")
+        if avg_hold > before["max_hold_minutes"] * 1.15:
+            _bounded_step(after, "max_hold_minutes", -1)
+            adjusted = True
+            notes.append("hold_too_long reduce max_hold_minutes")
+
+    changed = any(abs(after[k] - before[k]) > 1e-9 for k in after.keys())
+    adjusted = adjusted or changed
+    journal.append({
+        "ts": now_iso(),
+        "mode": APPRENTICE_MODE,
+        "features": features,
+        "before_params": before,
+        "after_params": after,
+        "adjusted": adjusted,
+        "rollback": rollback,
+        "reason": "; ".join(notes) if notes else "no_change_or_insufficient_data",
+        "observation_period": f"recent_{APPRENTICE_LOOKBACK}_paper_trades",
+    })
+    _save_apprentice_journal(journal)
+
+    return ApprenticeStatus(
+        mode=APPRENTICE_MODE,
+        enabled=True,
+        params=after,
+        adjusted=adjusted,
+        rollback=rollback,
+        recent_winrate=safe_float(features.get("winrate"), 0.0),
+        notes=notes or ["no_adjustment"],
+    )
+
+
+def apply_apprentice_params_to_plan(plan: Plan, s: Snapshot, apprentice: ApprenticeStatus) -> Plan:
+    if not apprentice.enabled:
+        return plan
+
+    rr_min = safe_float(apprentice.params.get("rr_min"), 1.6)
+    risk_pct = safe_float(apprentice.params.get("risk_pct"), 0.7)
+    buy_th = safe_float(apprentice.params.get("rsi_buy_threshold"), 35.0)
+    sell_th = safe_float(apprentice.params.get("rsi_sell_threshold"), 65.0)
+
+    if plan.action == "BUY" and s.rsi14 > sell_th:
+        plan.action = "HOLD"
+    elif plan.action == "SELL" and s.rsi14 < buy_th:
+        plan.action = "HOLD"
+
+    if plan.action in {"BUY", "SELL"}:
+        current_risk = max(abs(plan.entry - plan.sl), 1.0)
+        scaled_risk = max(12.0, current_risk * clamp(risk_pct, 0.2, 2.0))
+        if plan.action == "BUY":
+            plan.sl = round(plan.entry - scaled_risk, 2)
+            plan.tp = round(plan.entry + scaled_risk * rr_min, 2)
+        else:
+            plan.sl = round(plan.entry + scaled_risk, 2)
+            plan.tp = round(plan.entry - scaled_risk * rr_min, 2)
+
+    plan.reason = f"{plan.reason} | apprentice_params={json.dumps(apprentice.params, ensure_ascii=False)}"
+    return plan
+
+
 def _main_impl() -> int:
     args = parse_args()
     if (os.getenv("TRADE_ANALYST_TIME_GUARD_SELFTEST") or "").strip() == "1":
@@ -1913,6 +2166,7 @@ def _main_impl() -> int:
     quota_degraded = False
     gemini_degrade_cause = ""
     gemini_cooldown_state: Dict[str, Any] = {"active": False, "until": None, "reason": "", "set_at": None}
+    apprentice_status = ApprenticeStatus(mode=args.mode, enabled=False, params=_default_apprentice_params(), adjusted=False, rollback=False, recent_winrate=0.0, notes=["init"])
     conn = sqlite3.connect(DB_PATH)
     try:
         ensure_db(conn)
@@ -1992,9 +2246,12 @@ def _main_impl() -> int:
         gemini_degrade_cause = str(gemini_result.get("degrade_cause") or "")
 
         plan, openai_result = step3_openai_arbitrate(s, groq_result.get("normalized", {}), gemini_result.get("raw_json", {}))
+        apprentice_status = derive_apprentice_status(conn, args.mode)
+        plan = apply_apprentice_params_to_plan(plan, s, apprentice_status)
 
         prior_trade_status = get_prior_trade_status(conn, s.close)
         readonly_mode = bool(get_circuit_breaker_state(conn).get("active"))
+        # apprentice 僅允許 paper trading；本程式只會寫入本地 SQLite 模擬交易，不會觸發任何實盤路徑
         opened = maybe_open_trade(conn, plan, rollover_decision.active_contract, readonly_mode=readonly_mode)
         cb_state = get_circuit_breaker_state(conn)
         perf_anomaly = get_recent_performance_anomaly(conn)
@@ -2062,6 +2319,7 @@ def _main_impl() -> int:
             rollover_status=rollover_status,
             consultant_tags=consultant_tags,
             quota_degraded=quota_degraded,
+            apprentice=apprentice_status,
         )
     )
 
@@ -2097,6 +2355,7 @@ def _main_impl() -> int:
         "risk_control": risk_control,
         "strategy_mode": {
             "mode": mode_ctx.mode,
+            "run_mode": args.mode,
             "context": mode_ctx.context,
             "recent_winrate": recent_stats.get("winrate"),
             "recent_count": recent_stats.get("count"),
@@ -2104,6 +2363,15 @@ def _main_impl() -> int:
             "force_goal_optimization": force_goal_optimization,
         },
         "tri_brain_status": tri_brain_status,
+        "apprentice": {
+            "enabled": apprentice_status.enabled,
+            "params": apprentice_status.params,
+            "adjusted": apprentice_status.adjusted,
+            "rollback": apprentice_status.rollback,
+            "recent_winrate": apprentice_status.recent_winrate,
+            "notes": apprentice_status.notes,
+            "journal_path": str(APPRENTICE_JOURNAL_PATH),
+        },
         "consultant_tags": consultant_tags,
         "consultant_notes": consultant_notes,
         "performance_anomaly": perf_anomaly,
@@ -2132,6 +2400,7 @@ def _main_impl() -> int:
     print(f"[info] Groq risk: {json.dumps(groq_result.get('normalized', {}), ensure_ascii=False)}")
     print(f"[info] Gemini degrade: {quota_degraded} cause={gemini_degrade_cause} cooldown={json.dumps(gemini_cooldown_state, ensure_ascii=False)}")
     print(f"[info] Plan: sentiment_score={plan.sentiment_score} action={plan.action} entry={plan.entry:.2f} sl={plan.sl:.2f} tp={plan.tp:.2f}")
+    print(f"[info] Apprentice: enabled={apprentice_status.enabled} adjusted={apprentice_status.adjusted} rollback={apprentice_status.rollback} recent_winrate={apprentice_status.recent_winrate:.1f} params={json.dumps(apprentice_status.params, ensure_ascii=False)}")
     print(f"[info] new_skill_proposal={json.dumps(plan.new_skill_proposal, ensure_ascii=False)}")
     print(f"[info] Risk: daily_pnl={daily_pnl:.2f} losing_streak={losing_streak} circuit_breaker_active={cb_state.get('active')} reason={cb_state.get('reason')}")
     print(f"[info] Trades: settled_open={closed}, opened_new={opened} readonly_mode={cb_state.get('active')}")
