@@ -42,5 +42,9 @@
   "trade-health-check": {
     "description": "Check latest trade log health status and optionally notify Telegram",
     "command": "python3 scripts/trade_health_check.py"
+  },
+  "batch-review-10": {
+    "description": "Trigger multi-model trading review for each new 10 trade logs",
+    "command": "python3 scripts/batch_review_10.py"
   }
 }

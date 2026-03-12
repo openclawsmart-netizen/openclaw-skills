@@ -1,0 +1,27 @@
+{
+  "last_processed_count": 30,
+  "updated_at": "2026-03-12T08:50:44.088894+00:00",
+  "history": [
+    {
+      "batch_start": 1,
+      "batch_end": 10,
+      "report": "reports/batch_review_10_20260312_165039_1_10.md",
+      "telegram": "ok",
+      "processed_at": "2026-03-12T08:50:40.635973+00:00"
+    },
+    {
+      "batch_start": 11,
+      "batch_end": 20,
+      "report": "reports/batch_review_10_20260312_165040_11_20.md",
+      "telegram": "ok",
+      "processed_at": "2026-03-12T08:50:42.479629+00:00"
+    },
+    {
+      "batch_start": 21,
+      "batch_end": 30,
+      "report": "reports/batch_review_10_20260312_165042_21_30.md",
+      "telegram": "ok",
+      "processed_at": "2026-03-12T08:50:44.088864+00:00"
+    }
+  ]
+}
