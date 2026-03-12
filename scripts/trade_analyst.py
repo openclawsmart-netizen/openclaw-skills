@@ -24,6 +24,9 @@ import sqlite3
 import subprocess
 import sys
 import time
+import hashlib
+import re
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -36,6 +39,11 @@ DEFENSIVE_PROGRESS_THRESHOLD = 90.0
 STABLE_WINRATE_LOOKBACK = 8
 STABLE_WINRATE_THRESHOLD = 55.0
 from zoneinfo import ZoneInfo
+
+try:
+    import fcntl  # type: ignore
+except Exception:  # pragma: no cover
+    fcntl = None  # type: ignore
 
 SYMBOL = "YM=F"
 INTERVAL = "15m"
@@ -54,6 +62,8 @@ DB_PATH = DATA_DIR / "trading_v1.db"
 TRADE_LOG_JSON = DATA_DIR / "trade_logs.json"
 TRADE_LOG_CSV = DATA_DIR / "trade_logs.csv"
 TELEGRAM_SCRIPT = BASE_DIR / "proactive-agent" / "send_telegram.py"
+RUN_LOCK_PATH = DATA_DIR / "trade_analyst.lock"
+TELEGRAM_DEDUP_PATH = DATA_DIR / "telegram_dedup.json"
 
 GROQ_MODEL = (os.getenv("GROQ_MODEL") or "llama-3.1-8b-instant").strip()
 GEMINI_MODEL = (os.getenv("GEMINI_MODEL") or "gemini-2.0-flash").strip()
@@ -137,6 +147,70 @@ def append_cron_trade_log(message: str) -> None:
 
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _load_env_file(path: Path) -> None:
+    if not path.exists() or not path.is_file():
+        return
+    line_re = re.compile(r"^(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$")
+    try:
+        lines = path.read_text(encoding="utf-8", errors="ignore").splitlines()
+    except Exception:
+        return
+    for raw in lines:
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        m = line_re.match(line)
+        if not m:
+            continue
+        k, v = m.group(1), m.group(2).strip()
+        if (v.startswith('"') and v.endswith('"')) or (v.startswith("'") and v.endswith("'")):
+            v = v[1:-1]
+        os.environ.setdefault(k, v)
+
+
+def load_runtime_env() -> None:
+    _load_env_file(BASE_DIR / ".env")
+    _load_env_file(Path("/root/.openclaw_env"))
+
+
+@contextmanager
+def single_instance_guard(lock_path: Path):
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    fp = lock_path.open("a+", encoding="utf-8")
+    acquired = False
+    try:
+        if fcntl is not None:
+            try:
+                fcntl.flock(fp.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                acquired = True
+            except BlockingIOError:
+                acquired = False
+        else:
+            acquired = True
+
+        if not acquired:
+            append_cron_trade_log("run_skipped reason=lock_active")
+            print("[info] Skip: another trade-analyst run is still active.")
+            yield False
+            return
+
+        fp.seek(0)
+        fp.truncate(0)
+        fp.write(now_iso())
+        fp.flush()
+        yield True
+    finally:
+        if acquired and fcntl is not None:
+            try:
+                fcntl.flock(fp.fileno(), fcntl.LOCK_UN)
+            except Exception:
+                pass
+        try:
+            fp.close()
+        except Exception:
+            pass
 
 
 def safe_float(v: Any, default: float) -> float:
@@ -1647,9 +1721,54 @@ def telegram_summary(
     return msg
 
 
+def _read_telegram_dedup_state() -> Dict[str, Any]:
+    if not TELEGRAM_DEDUP_PATH.exists():
+        return {}
+    try:
+        with TELEGRAM_DEDUP_PATH.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            return data
+    except Exception:
+        return {}
+    return {}
+
+
+def _write_telegram_dedup_state(state: Dict[str, Any]) -> None:
+    try:
+        TELEGRAM_DEDUP_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with TELEGRAM_DEDUP_PATH.open("w", encoding="utf-8") as f:
+            json.dump(state, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+
+def _is_telegram_duplicate(msg: str) -> bool:
+    dedup_seconds = int((os.getenv("TRADE_ANALYST_TELEGRAM_DEDUP_SECONDS") or "300").strip() or 300)
+    if dedup_seconds <= 0:
+        return False
+
+    digest = hashlib.sha256(msg.encode("utf-8")).hexdigest()
+    state = _read_telegram_dedup_state()
+    prev_digest = str(state.get("last_hash") or "")
+    prev_ts = _parse_iso_utc(state.get("last_sent_at"))
+    now_utc = datetime.now(timezone.utc)
+
+    if prev_digest and prev_digest == digest and prev_ts is not None:
+        delta = (now_utc - prev_ts).total_seconds()
+        if 0 <= delta < dedup_seconds:
+            return True
+
+    _write_telegram_dedup_state({"last_hash": digest, "last_sent_at": now_utc.isoformat()})
+    return False
+
+
 def send_telegram(msg: str) -> str:
     if not TELEGRAM_SCRIPT.exists():
         return "skip: sender script not found"
+
+    if _is_telegram_duplicate(msg):
+        return "skip: deduplicated"
 
     proc = subprocess.run(
         [sys.executable, str(TELEGRAM_SCRIPT), "--message", msg],
@@ -1756,7 +1875,7 @@ def append_trade_log_and_export_csv(record: Dict[str, Any]) -> Tuple[int, str, s
     return len(records), str(TRADE_LOG_JSON), str(TRADE_LOG_CSV)
 
 
-def main() -> int:
+def _main_impl() -> int:
     args = parse_args()
     if (os.getenv("TRADE_ANALYST_TIME_GUARD_SELFTEST") or "").strip() == "1":
         _run_time_guard_selftest()
@@ -2021,6 +2140,14 @@ def main() -> int:
     print(f"[info] Log export: records={log_count} json={json_path} csv={csv_path}")
     print(f"[info] Telegram: {tg_state}")
     return 0
+
+
+def main() -> int:
+    load_runtime_env()
+    with single_instance_guard(RUN_LOCK_PATH) as acquired:
+        if not acquired:
+            return 0
+        return _main_impl()
 
 
 if __name__ == "__main__":
