@@ -40,6 +40,11 @@ SYMBOL = "YM=F"
 INTERVAL = "15m"
 PERIOD = "5d"
 
+YM_ROOT = "YM"
+YM_EXCHANGE_SUFFIX = ".CBT"
+YM_QUARTER_MONTH_CODES = [(3, "H"), (6, "M"), (9, "U"), (12, "Z")]
+CONSULTANT_COMMANDER_ROLLOVER_TAG = "🚨 [諮詢-指揮官]：目前處於換倉週，價差波動可能導致技術指標失真，請指揮官覆核策略。"
+
 BASE_DIR = Path(__file__).resolve().parents[1]
 DATA_DIR = BASE_DIR / "data"
 DB_PATH = DATA_DIR / "trading_v1.db"
@@ -99,6 +104,19 @@ class MonthlyProgress:
 class StrategyModeContext:
     mode: str
     context: str
+
+
+@dataclass
+class RolloverDecision:
+    active_contract: str
+    near_contract: str
+    far_contract: str
+    near_volume: Optional[float]
+    far_volume: Optional[float]
+    switched_to_far: bool
+    in_rollover_week: bool
+    reason: str
+    adjustment_method: str
 
 
 def eprint(msg: str) -> None:
@@ -328,19 +346,128 @@ def ensure_deps():
     return yf
 
 
-def fetch_snapshot(yf_module) -> Snapshot:
+def _normalize_download_df(df):
+    if df is None or df.empty:
+        return df
+    if hasattr(df.columns, "nlevels") and df.columns.nlevels > 1:
+        df.columns = [c[0] if isinstance(c, tuple) else c for c in df.columns]
+    return df
+
+
+def build_ym_contract_ticker(year: int, month: int) -> str:
+    month_code = {m: c for m, c in YM_QUARTER_MONTH_CODES}.get(month)
+    if not month_code:
+        raise ValueError(f"Unsupported YM quarter month: {month}")
+    yy = year % 100
+    return f"{YM_ROOT}{month_code}{yy:02d}{YM_EXCHANGE_SUFFIX}"
+
+
+def infer_near_far_ym_contracts(now_tpe: datetime) -> Tuple[str, str, int, int]:
+    y = now_tpe.year
+    m = now_tpe.month
+    months = [x[0] for x in YM_QUARTER_MONTH_CODES]
+    near_month = next((mm for mm in months if mm >= m), months[0])
+    near_year = y if near_month >= m else y + 1
+    idx = months.index(near_month)
+    far_month = months[(idx + 1) % len(months)]
+    far_year = near_year if far_month > near_month else near_year + 1
+    return build_ym_contract_ticker(near_year, near_month), build_ym_contract_ticker(far_year, far_month), near_month, far_month
+
+
+def fetch_contract_volume(yf_module, ticker: str) -> Optional[float]:
     try:
-        df = yf_module.download(SYMBOL, period=PERIOD, interval=INTERVAL, progress=False, auto_adjust=False)
+        vdf = _normalize_download_df(yf_module.download(ticker, period="10d", interval="1d", progress=False, auto_adjust=False))
+    except Exception:
+        return None
+    if vdf is None or vdf.empty or "Volume" not in vdf.columns:
+        return None
+    vols = vdf["Volume"].dropna()
+    if vols.empty:
+        return None
+    return float(vols.tail(3).mean())
+
+
+def detect_rollover_and_active_contract(yf_module, now_tpe: datetime) -> RolloverDecision:
+    near_contract, far_contract, near_month, _ = infer_near_far_ym_contracts(now_tpe)
+    near_volume = fetch_contract_volume(yf_module, near_contract)
+    far_volume = fetch_contract_volume(yf_module, far_contract)
+
+    switched_to_far = False
+    active_contract = SYMBOL
+    reason = "fallback_continuous_symbol"
+
+    if near_volume is not None and far_volume is not None:
+        switched_to_far = far_volume > near_volume
+        active_contract = far_contract if switched_to_far else near_contract
+        reason = f"volume_compare far({far_volume:.0f}) {'>' if switched_to_far else '<='} near({near_volume:.0f})"
+    elif near_volume is not None:
+        active_contract = near_contract
+        reason = "far_volume_missing_use_near"
+    elif far_volume is not None:
+        active_contract = far_contract
+        reason = "near_volume_missing_use_far"
+
+    in_rollover_week = now_tpe.month == near_month and 8 <= now_tpe.day <= 21
+
+    return RolloverDecision(
+        active_contract=active_contract,
+        near_contract=near_contract,
+        far_contract=far_contract,
+        near_volume=near_volume,
+        far_volume=far_volume,
+        switched_to_far=switched_to_far,
+        in_rollover_week=in_rollover_week,
+        reason=reason,
+        adjustment_method="back-adjust spread stitching",
+    )
+
+
+def build_continuous_adjusted_df(yf_module, decision: RolloverDecision):
+    # 連續合約處理：
+    # 1) 抓取近月與遠月資料
+    # 2) 用重疊區段的收盤價差做 back-adjust（把近月歷史平移到遠月價位）
+    # 3) 若已換倉，拼接為「前段近月(已校正) + 後段遠月」避免換月跳空污染 EMA/RSI/MACD
+    near_df = _normalize_download_df(yf_module.download(decision.near_contract, period=PERIOD, interval=INTERVAL, progress=False, auto_adjust=False))
+    far_df = _normalize_download_df(yf_module.download(decision.far_contract, period=PERIOD, interval=INTERVAL, progress=False, auto_adjust=False))
+
+    if near_df is None or near_df.empty:
+        base = _normalize_download_df(yf_module.download(SYMBOL, period=PERIOD, interval=INTERVAL, progress=False, auto_adjust=False))
+        return base, "fallback: near_contract_missing"
+    if far_df is None or far_df.empty:
+        return near_df, "fallback: far_contract_missing"
+
+    overlap_idx = near_df.index.intersection(far_df.index)
+    if len(overlap_idx) == 0:
+        return far_df if decision.switched_to_far else near_df, "fallback: no_overlap"
+
+    spread = float((far_df.loc[overlap_idx, "Close"] - near_df.loc[overlap_idx, "Close"]).median())
+    adjusted_near = near_df.copy()
+    for col in ("Open", "High", "Low", "Close"):
+        if col in adjusted_near.columns:
+            adjusted_near[col] = adjusted_near[col].astype(float) + spread
+
+    if decision.switched_to_far:
+        switch_ts = overlap_idx[-1]
+        stitched = adjusted_near[adjusted_near.index < switch_ts].copy()
+        stitched = stitched.combine_first(far_df[far_df.index >= switch_ts].copy())
+        stitched = stitched.sort_index()
+        return stitched, f"back-adjust spread={spread:.2f} switched_at={switch_ts}"
+
+    return adjusted_near.sort_index(), f"back-adjust spread={spread:.2f} near-active"
+
+
+def fetch_snapshot(yf_module, decision: RolloverDecision) -> Snapshot:
+    try:
+        df, _ = build_continuous_adjusted_df(yf_module, decision)
+        if decision.active_contract not in {decision.near_contract, decision.far_contract}:
+            df = _normalize_download_df(yf_module.download(SYMBOL, period=PERIOD, interval=INTERVAL, progress=False, auto_adjust=False))
     except Exception as exc:
         eprint(f"[error] Failed to fetch market data from yfinance: {exc}")
         sys.exit(4)
 
     if df is None or df.empty:
-        eprint("[error] No market data returned for YM=F")
+        eprint("[error] No market data returned for YM")
         sys.exit(4)
-
-    if hasattr(df.columns, "nlevels") and df.columns.nlevels > 1:
-        df.columns = [c[0] if isinstance(c, tuple) else c for c in df.columns]
 
     if "Close" not in df.columns:
         eprint("[error] Market data missing required column: Close")
@@ -616,6 +743,8 @@ def build_consultant_routing(
     new_skill_proposal: Optional[Dict[str, str]],
     optimization_suggestion: str,
     indicator_calc_seconds: float,
+    in_rollover_week: bool,
+    perf_anomaly: Dict[str, Any],
 ) -> Tuple[List[str], List[str]]:
     tags: List[str] = []
     notes: List[str] = []
@@ -636,6 +765,10 @@ def build_consultant_routing(
         if CONSULTANT_COMMANDER_TAG not in tags:
             tags.append(CONSULTANT_COMMANDER_TAG)
         notes.append("觸發原因：error_review 顯示策略邏輯嚴重偏離")
+
+    if in_rollover_week and bool(perf_anomaly.get("abnormal")):
+        tags.append(CONSULTANT_COMMANDER_ROLLOVER_TAG)
+        notes.append(f"觸發原因：換倉週績效異常 ({perf_anomaly.get('reason', 'unknown')})")
 
     # B) 諮詢-工程師（複雜數學/大量資料/低延遲/指標計算 > 3 秒）
     proposal_text = ""
@@ -784,6 +917,54 @@ def get_recent_closed_stats(conn: sqlite3.Connection, lookback: int = STABLE_WIN
     winrate = (wins / count) * 100.0 if count else 0.0
     stable = count >= min(lookback, 3) and winrate >= STABLE_WINRATE_THRESHOLD
     return {"count": count, "winrate": float(winrate), "stable": bool(stable)}
+
+
+def get_recent_performance_anomaly(conn: sqlite3.Connection) -> Dict[str, Any]:
+    rows = conn.execute(
+        """
+        SELECT status, pnl
+        FROM trades
+        WHERE status IN ('WIN','LOSS','CLOSED') AND closed_at IS NOT NULL
+        ORDER BY datetime(closed_at) DESC
+        LIMIT 30
+        """
+    ).fetchall()
+    if len(rows) < 8:
+        return {"abnormal": False, "reason": "insufficient_history"}
+
+    def stat(seg):
+        wins = 0
+        total_pnl = 0.0
+        for st, pnl in seg:
+            st_u = str(st or "").upper()
+            pnl_v = safe_float(pnl, 0.0)
+            if st_u == "WIN" or (st_u == "CLOSED" and pnl_v > 0):
+                wins += 1
+            total_pnl += pnl_v
+        cnt = len(seg)
+        return (wins / cnt * 100.0 if cnt else 0.0), (total_pnl / cnt if cnt else 0.0)
+
+    recent = rows[:5]
+    baseline = rows[5:25] if len(rows) >= 15 else rows[5:]
+    rw, rexp = stat(recent)
+    bw, bexp = stat(baseline)
+
+    abnormal = (bw - rw >= 20.0) or (rexp < 0 and bexp > 0)
+    reason = f"recent_winrate={rw:.1f} baseline_winrate={bw:.1f} recent_exp={rexp:.2f} baseline_exp={bexp:.2f}"
+    return {"abnormal": abnormal, "reason": reason, "recent_winrate": rw, "baseline_winrate": bw, "recent_expectancy": rexp, "baseline_expectancy": bexp}
+
+
+def get_last_logged_active_contract() -> Optional[str]:
+    if not TRADE_LOG_JSON.exists():
+        return None
+    try:
+        with TRADE_LOG_JSON.open("r", encoding="utf-8") as f:
+            arr = json.load(f)
+        if isinstance(arr, list) and arr:
+            return str(arr[-1].get("active_contract") or "").strip() or None
+    except Exception:
+        return None
+    return None
 
 
 def recent_three_closed_all_loss(conn: sqlite3.Connection) -> bool:
@@ -1209,7 +1390,7 @@ def has_open_trade(conn: sqlite3.Connection) -> bool:
     return row is not None
 
 
-def maybe_open_trade(conn: sqlite3.Connection, p: Plan, readonly_mode: bool = False) -> bool:
+def maybe_open_trade(conn: sqlite3.Connection, p: Plan, symbol: str, readonly_mode: bool = False) -> bool:
     if readonly_mode:
         return False
 
@@ -1227,7 +1408,7 @@ def maybe_open_trade(conn: sqlite3.Connection, p: Plan, readonly_mode: bool = Fa
             ai_reflection, ai_plan_raw
         ) VALUES (?, ?, ?, ?, ?, ?, ?, 'OPEN', ?, ?)
         """,
-        (SYMBOL, now_iso(), side, p.entry, p.sl, p.tp, p.reason, p.reflection_one_liner, p.raw),
+        (symbol, now_iso(), side, p.entry, p.sl, p.tp, p.reason, p.reflection_one_liner, p.raw),
     )
     conn.commit()
     return True
@@ -1239,6 +1420,8 @@ def telegram_summary(
     trend: str,
     p: Plan,
     monthly: MonthlyProgress,
+    active_contract: str,
+    rollover_status: str,
     consultant_tags: Optional[List[str]] = None,
 ) -> str:
     msg = (
@@ -1246,6 +1429,7 @@ def telegram_summary(
         f"🧠 自我檢討：{winrate:.1f}% - {reflection}\n"
         f"📈 本月進度：{monthly.current_pnl:.2f} / {MONTHLY_TARGET_POINTS:.0f} 點 ({monthly.achievement_pct:.1f}%)\n"
         f"📈 當前盤勢：{trend}\n"
+        f"🧾 Active Contract：{active_contract} ({rollover_status})\n"
         f"🤖 最新計畫：{p.action} (Entry: {p.entry:.2f}, SL: {p.sl:.2f}, TP: {p.tp:.2f})"
     )
     if p.new_skill_proposal:
@@ -1393,11 +1577,16 @@ def main() -> int:
         sys.exit(0)
 
     yf = ensure_deps()
+    rollover_decision = detect_rollover_and_active_contract(yf, now_tpe)
     indicator_t0 = time.perf_counter()
-    s = fetch_snapshot(yf)
+    s = fetch_snapshot(yf, rollover_decision)
     indicator_calc_seconds = time.perf_counter() - indicator_t0
 
+    prev_active_contract = get_last_logged_active_contract()
+    rollover_status = "ROLLED" if rollover_decision.switched_to_far else "NEAR"
+
     DATA_DIR.mkdir(parents=True, exist_ok=True)
+    perf_anomaly: Dict[str, Any] = {"abnormal": False, "reason": "not_evaluated"}
     conn = sqlite3.connect(DB_PATH)
     try:
         ensure_db(conn)
@@ -1459,12 +1648,16 @@ def main() -> int:
 
         prior_trade_status = get_prior_trade_status(conn, s.close)
         readonly_mode = bool(get_circuit_breaker_state(conn).get("active"))
-        opened = maybe_open_trade(conn, plan, readonly_mode=readonly_mode)
+        opened = maybe_open_trade(conn, plan, rollover_decision.active_contract, readonly_mode=readonly_mode)
         cb_state = get_circuit_breaker_state(conn)
+        perf_anomaly = get_recent_performance_anomaly(conn)
     finally:
         conn.close()
 
     trend = trend_summary(s)
+
+    if rollover_decision.switched_to_far and rollover_decision.active_contract != (prev_active_contract or ""):
+        send_telegram(f"🔄 [換倉警報]：主力資金已轉向 {rollover_decision.active_contract}，系統已自動同步切換。")
 
     expected_profit_points = plan.tp - plan.entry if plan.action != "SELL" else plan.entry - plan.tp
     optimization_suggestion = str(gemini_result.get("raw_json", {}).get("optimization_suggestion", "")).strip()
@@ -1499,6 +1692,8 @@ def main() -> int:
         new_skill_proposal=plan.new_skill_proposal,
         optimization_suggestion=optimization_suggestion,
         indicator_calc_seconds=indicator_calc_seconds,
+        in_rollover_week=rollover_decision.in_rollover_week,
+        perf_anomaly=perf_anomaly,
     )
 
     tg_state = send_telegram(
@@ -1508,12 +1703,26 @@ def main() -> int:
             trend,
             plan,
             monthly_progress,
+            active_contract=rollover_decision.active_contract,
+            rollover_status=rollover_status,
             consultant_tags=consultant_tags,
         )
     )
 
     log_record: Dict[str, Any] = {
         "date": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "active_contract": rollover_decision.active_contract,
+        "rollover": {
+            "near_contract": rollover_decision.near_contract,
+            "far_contract": rollover_decision.far_contract,
+            "near_volume": rollover_decision.near_volume,
+            "far_volume": rollover_decision.far_volume,
+            "switched_to_far": rollover_decision.switched_to_far,
+            "in_rollover_week": rollover_decision.in_rollover_week,
+            "decision_reason": rollover_decision.reason,
+            "adjustment_method": rollover_decision.adjustment_method,
+            "status": rollover_status,
+        },
         "entry_price": float(plan.entry),
         "take_profit_price": float(plan.tp),
         "stop_loss_price": float(plan.sl),
@@ -1541,11 +1750,16 @@ def main() -> int:
         "tri_brain_status": tri_brain_status,
         "consultant_tags": consultant_tags,
         "consultant_notes": consultant_notes,
+        "performance_anomaly": perf_anomaly,
         "indicator_calc_seconds": float(indicator_calc_seconds),
     }
     log_count, json_path, csv_path = append_trade_log_and_export_csv(log_record)
 
-    print(f"[info] Symbol={SYMBOL} interval={INTERVAL} ts={s.ts}")
+    print(f"[info] Symbol={SYMBOL} active_contract={rollover_decision.active_contract} interval={INTERVAL} ts={s.ts}")
+    print(
+        f"[info] Rollover: status={rollover_status} near={rollover_decision.near_contract}({rollover_decision.near_volume}) "
+        f"far={rollover_decision.far_contract}({rollover_decision.far_volume}) reason={rollover_decision.reason}"
+    )
     print(
         "[info] Indicators: "
         f"Close={s.close:.2f} EMA20={s.ema20:.2f} EMA50={s.ema50:.2f} RSI14={s.rsi14:.2f} "
