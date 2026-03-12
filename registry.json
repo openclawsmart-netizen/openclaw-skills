@@ -46,5 +46,9 @@
   "batch-review-10": {
     "description": "Trigger multi-model trading review for each new 10 trade logs",
     "command": "python3 scripts/batch_review_10.py"
+  },
+  "monitor-dashboard": {
+    "description": "Open bilingual live monitor dashboard in terminal",
+    "command": "python3 scripts/live_monitor_dashboard.py"
   }
 }
