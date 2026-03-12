@@ -256,13 +256,13 @@ HTML_PAGE = """<!doctype html>
       <table class="jobs-table">
         <thead>
           <tr>
-            <th>工作名稱<br/>Job Name</th>
-            <th>說明<br/>Description</th>
-            <th>指令<br/>Command</th>
-            <th>類型<br/>Type</th>
-            <th>狀態<br/>Status</th>
-            <th>最後執行<br/>Last Run</th>
-            <th>操作<br/>Actions</th>
+            <th>工作名稱<br/><span class="small">Job Name</span></th>
+            <th>說明<br/><span class="small">Description</span></th>
+            <th>指令<br/><span class="small">Command</span></th>
+            <th>類型<br/><span class="small">Type</span></th>
+            <th>狀態<br/><span class="small">Status</span></th>
+            <th>最後執行<br/><span class="small">Last Run</span></th>
+            <th>操作<br/><span class="small">Actions</span></th>
           </tr>
         </thead>
         <tbody id="jobsTableBody"></tbody>
@@ -424,18 +424,18 @@ HTML_PAGE = """<!doctype html>
         tdAction.className = 'jobs-actions';
 
         const runBtn = document.createElement('button');
-        runBtn.textContent = 'Run Now';
+        runBtn.textContent = '立即執行（Run Now）';
         runBtn.onclick = () => runJobAction('/api/jobs/run', job.jobName);
         tdAction.appendChild(runBtn);
 
         const enBtn = document.createElement('button');
-        enBtn.textContent = 'Enable';
+        enBtn.textContent = '啟用排程（Enable）';
         enBtn.className = 'safe';
         enBtn.onclick = () => runJobAction('/api/jobs/enable', job.jobName);
         tdAction.appendChild(enBtn);
 
         const disBtn = document.createElement('button');
-        disBtn.textContent = 'Disable';
+        disBtn.textContent = '停用排程（Disable）';
         disBtn.className = 'danger';
         disBtn.onclick = () => runJobAction('/api/jobs/disable', job.jobName);
         tdAction.appendChild(disBtn);
@@ -1080,23 +1080,36 @@ def export_latest_report() -> Tuple[bool, str, Optional[str]]:
 
 def _load_registry_jobs() -> Dict[str, Dict[str, str]]:
     zh_desc = {
-        "trade-analyst": "交易分析主程式（15m 技術指標 + 風控 + 訊息）",
-        "daily-brief": "每日簡報（新聞摘要 + Telegram 推送）",
-        "report-generator": "報表產生器（交易紀錄轉 Excel 並推送）",
-        "trade-health-check": "交易健康檢查（檢查最新交易狀態）",
-        "monitor-dashboard": "終端機監控儀表板",
-        "monitor-dashboard-web": "Web 監控儀表板",
+        "trade-analyst": "交易分析主程式",
+        "trade-apprentice": "交易學徒模式",
+        "trade-health-check": "交易健康檢查",
+        "batch-review-10": "十筆交易批次審查",
+        "monitor-dashboard-web": "Web 即時監控儀表板",
+        "monitor-dashboard": "終端機即時監控儀表板",
+        "backtest-engine": "回測引擎",
+        "report-generator": "交易報表產生器",
+        "daily-brief": "每日重點簡報",
+        "system-status": "系統狀態彙整",
+        "health-check": "系統健康檢查",
+        "smart-cleanup": "智慧清理與空間回收",
+        "web-fetch": "網頁抓取與摘要",
+        "ai-orchestrator": "AI 任務協調器",
     }
+
     data = _safe_read_json(REGISTRY_JSON, {})
     if not isinstance(data, dict):
         return {}
+
     out: Dict[str, Dict[str, str]] = {}
     for job_name, meta in data.items():
         if not isinstance(meta, dict):
             continue
-        description = str(meta.get("description") or "MISSING")
-        if not re.search(r"[\u4e00-\u9fff]", description) and job_name in zh_desc:
-            description = f"{zh_desc[job_name]} / {description}"
+
+        description = str(meta.get("description") or "MISSING").strip()
+        if not re.search(r"[\u4e00-\u9fff]", description):
+            zh_summary = zh_desc.get(str(job_name), "工作任務")
+            description = f"{zh_summary}（{description}）"
+
         out[str(job_name)] = {
             "description": description,
             "command": str(meta.get("command") or f"./run-skill.sh {job_name}"),
