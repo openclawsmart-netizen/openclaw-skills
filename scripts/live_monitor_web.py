@@ -5,8 +5,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import subprocess
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -19,13 +20,17 @@ REPORTS_DIR = BASE_DIR / "reports"
 
 TRADE_LOG_JSON = DATA_DIR / "trade_logs.json"
 CRON_LOG = LOGS_DIR / "cron_trade.log"
+MANUAL_APPRENTICE_LOG = LOGS_DIR / "cron_apprentice_manual.log"
+
+TRADE_ANALYST_CRON_TAG = "run-skill.sh trade-analyst"
+TRADE_ANALYST_SAFE_CRON = f"*/30 * * * * cd {BASE_DIR} && ./run-skill.sh trade-analyst >> logs/cron_trade.log 2>&1"
 
 HTML_PAGE = """<!doctype html>
 <html lang="zh-Hant">
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>監控儀表板 / Monitor Dashboard</title>
+  <title>監控儀表板（Monitor Dashboard）</title>
   <style>
     :root {
       --bg: #0b1220;
@@ -37,6 +42,7 @@ HTML_PAGE = """<!doctype html>
       --warn: #f59e0b;
       --bad: #ef4444;
       --border: #243149;
+      --hero-bg: #0f172a;
     }
     * { box-sizing: border-box; }
     body {
@@ -55,11 +61,68 @@ HTML_PAGE = """<!doctype html>
     }
     h1 { margin: 0; font-size: 20px; }
     #updatedAt { color: var(--muted); font-size: 13px; }
+    .hero-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+      gap: 12px;
+      padding: 12px 12px 0 12px;
+    }
+    .hero {
+      background: var(--hero-bg);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 14px;
+      min-height: 130px;
+    }
+    .hero h2 {
+      margin: 0;
+      color: var(--accent);
+      font-size: 14px;
+    }
+    .hero .big {
+      margin-top: 10px;
+      font-size: 30px;
+      font-weight: 800;
+      line-height: 1.1;
+    }
+    .hero .sub {
+      margin-top: 6px;
+      color: var(--muted);
+      font-size: 12px;
+    }
+    .ok { color: var(--ok); }
+    .warn { color: var(--warn); }
+    .bad { color: var(--bad); }
+
+    .action-bar {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      padding: 12px;
+    }
+    button {
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 10px 12px;
+      font-size: 13px;
+      color: var(--text);
+      background: #1f2937;
+      cursor: pointer;
+    }
+    button:hover { filter: brightness(1.1); }
+    button.danger { background: #3b1111; border-color: #7f1d1d; }
+    button.safe { background: #0f2b19; border-color: #166534; }
+    .action-msg {
+      width: 100%;
+      font-size: 13px;
+      color: var(--muted);
+    }
+
     .grid {
       display: grid;
       grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
       gap: 12px;
-      padding: 12px;
+      padding: 0 12px 12px 12px;
     }
     .card {
       background: var(--panel);
@@ -73,14 +136,6 @@ HTML_PAGE = """<!doctype html>
       font-size: 15px;
       color: var(--accent);
     }
-    .status {
-      font-size: 24px;
-      font-weight: 700;
-      margin-top: 8px;
-    }
-    .ok { color: var(--ok); }
-    .warn { color: var(--warn); }
-    .bad { color: var(--bad); }
     ul { margin: 0; padding-left: 18px; }
     li { margin: 4px 0; line-height: 1.35; }
     .kv { width: 100%; border-collapse: collapse; }
@@ -98,18 +153,39 @@ HTML_PAGE = """<!doctype html>
 </head>
 <body>
   <header>
-    <h1>網頁儀表板 / Web Monitor Dashboard</h1>
-    <div id="updatedAt">Updated At: -</div>
+    <h1>交易監控儀表板（Trading Monitor Dashboard）</h1>
+    <div id="updatedAt">更新時間（Updated At）: -</div>
   </header>
+
+  <section class="hero-grid">
+    <article class="hero">
+      <h2>目前動作（Current Action）</h2>
+      <div id="heroAction" class="big">-</div>
+      <div id="heroActionSub" class="sub">-</div>
+    </article>
+    <article class="hero">
+      <h2>系統狀態（System Status）</h2>
+      <div id="heroSystem" class="big">-</div>
+      <div id="heroSystemSub" class="sub">-</div>
+    </article>
+    <article class="hero">
+      <h2>下次更新預估（Next Update ETA）</h2>
+      <div id="heroEta" class="big">-</div>
+      <div id="heroEtaSub" class="sub">-</div>
+    </article>
+  </section>
+
+  <section class="action-bar">
+    <button class="danger" onclick="runAction('/api/actions/pause-trade-analyst')">暫停交易排程（Pause Trade Analyst）</button>
+    <button class="safe" onclick="runAction('/api/actions/restore-trade-analyst')">恢復交易排程（Restore Trade Analyst */30）</button>
+    <button onclick="runAction('/api/actions/run-apprentice')">手動跑 Apprentice（Run Apprentice）</button>
+    <button onclick="runAction('/api/actions/export-latest-report')">匯出最新報告（Export Latest Report）</button>
+    <div id="actionMsg" class="action-msg">-</div>
+  </section>
 
   <main class="grid">
     <section class="card">
-      <h2>目前狀態 / Current Status</h2>
-      <div id="statusText" class="status">-</div>
-    </section>
-
-    <section class="card">
-      <h2>最近任務 / Recent Tasks</h2>
+      <h2>最近任務（Recent Tasks）</h2>
       <div class="small">Cron</div>
       <ul id="recentCron"></ul>
       <div class="small">Reports</div>
@@ -119,22 +195,27 @@ HTML_PAGE = """<!doctype html>
     </section>
 
     <section class="card">
-      <h2>排程狀態 / Scheduler</h2>
+      <h2>排程狀態（Scheduler）</h2>
       <ul id="scheduler"></ul>
     </section>
 
     <section class="card">
-      <h2>交易摘要 / Trade Snapshot</h2>
+      <h2>健康摘要（Health Summary）</h2>
+      <table class="kv" id="healthSummary"></table>
+    </section>
+
+    <section class="card">
+      <h2>交易摘要（Trade Snapshot）</h2>
       <table class="kv" id="tradeSnapshot"></table>
     </section>
 
     <section class="card">
-      <h2>風控摘要 / Risk Control</h2>
+      <h2>風控摘要（Risk Control）</h2>
       <table class="kv" id="risk"></table>
     </section>
 
     <section class="card">
-      <h2>模式與路由 / Mode & Routing</h2>
+      <h2>模式與路由（Mode & Routing）</h2>
       <table class="kv" id="modeRouting"></table>
     </section>
   </main>
@@ -142,10 +223,10 @@ HTML_PAGE = """<!doctype html>
   <script>
     const MISSING = 'MISSING';
 
-    function classForStatus(en) {
-      if (en === 'Running') return 'ok';
-      if (en === 'Paused') return 'bad';
-      return 'warn';
+    function classForLevel(level) {
+      if (level === 'ok') return 'ok';
+      if (level === 'warn') return 'warn';
+      return 'bad';
     }
 
     function setList(id, items) {
@@ -176,26 +257,56 @@ HTML_PAGE = """<!doctype html>
       });
     }
 
+    async function runAction(path) {
+      const msg = document.getElementById('actionMsg');
+      msg.textContent = '執行中（Running）...';
+      try {
+        const res = await fetch(path, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ source: 'dashboard' }),
+        });
+        const data = await res.json();
+        msg.textContent = `${data.ok ? '✅' : '❌'} ${data.message || '-'}${data.path ? ' | ' + data.path : ''}`;
+      } catch (err) {
+        msg.textContent = `❌ 請求失敗（Request Failed）: ${err}`;
+      }
+      await refresh();
+    }
+
     async function refresh() {
       try {
         const res = await fetch('/api/snapshot?_=' + Date.now(), { cache: 'no-store' });
         const data = await res.json();
 
-        document.getElementById('updatedAt').textContent = 'Updated At: ' + (data.generated_at || '-');
-        const status = document.getElementById('statusText');
-        status.textContent = `${data?.status?.zh || '-'} / ${data?.status?.en || '-'}`;
-        status.className = 'status ' + classForStatus(data?.status?.en);
+        document.getElementById('updatedAt').textContent = '更新時間（Updated At）: ' + (data.generated_at || '-');
+
+        const heroAction = document.getElementById('heroAction');
+        heroAction.textContent = data?.hero?.current_action?.text || '-';
+        heroAction.className = 'big ' + classForLevel(data?.hero?.current_action?.level || 'warn');
+        document.getElementById('heroActionSub').textContent = data?.hero?.current_action?.detail || '-';
+
+        const heroSystem = document.getElementById('heroSystem');
+        heroSystem.textContent = data?.hero?.system_status?.text || '-';
+        heroSystem.className = 'big ' + classForLevel(data?.hero?.system_status?.level || 'warn');
+        document.getElementById('heroSystemSub').textContent = data?.hero?.system_status?.detail || '-';
+
+        const heroEta = document.getElementById('heroEta');
+        heroEta.textContent = data?.hero?.next_update_eta?.text || '-';
+        heroEta.className = 'big ' + classForLevel(data?.hero?.next_update_eta?.level || 'warn');
+        document.getElementById('heroEtaSub').textContent = data?.hero?.next_update_eta?.detail || '-';
 
         setList('recentCron', data?.recent_tasks?.cron || []);
         setList('recentReports', data?.recent_tasks?.reports || []);
         setList('recentTrades', data?.recent_tasks?.trades || []);
         setList('scheduler', data?.scheduler || []);
 
+        setTable('healthSummary', data?.health_summary || {});
         setTable('tradeSnapshot', data?.trade_snapshot || {});
         setTable('risk', data?.risk || {});
         setTable('modeRouting', data?.mode_routing || {});
       } catch (err) {
-        document.getElementById('updatedAt').textContent = 'Updated At: fetch failed';
+        document.getElementById('updatedAt').textContent = '更新失敗（Fetch failed）';
       }
     }
 
@@ -240,45 +351,170 @@ def _fmt_missing(v: Any) -> Any:
     return v
 
 
-def _get_crontab_lines() -> List[str]:
+def _parse_log_ts(line: str) -> Optional[datetime]:
+    if not line.startswith("[") or "]" not in line:
+        return None
+    raw = line[1 : line.index("]")]
     try:
-        res = subprocess.run(["crontab", "-l"], capture_output=True, text=True, check=False)
-        if res.returncode != 0:
-            return ["MISSING"]
-        lines = [ln.strip() for ln in res.stdout.splitlines() if ln.strip() and not ln.strip().startswith("#")]
-        keys = ("run-skill.sh", "trade", "batch", "daily", "system-status", "health", "report")
-        filtered = [ln for ln in lines if any(k in ln for k in keys)]
-        return filtered[:8] if filtered else ["MISSING"]
+        return datetime.strptime(raw, "%Y-%m-%d %H:%M:%S").replace(tzinfo=datetime.now().astimezone().tzinfo)
     except Exception:
+        return None
+
+
+def _run_crontab(args: List[str], input_text: Optional[str] = None) -> Tuple[bool, str]:
+    try:
+        res = subprocess.run(
+            ["crontab", *args],
+            input=input_text,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if res.returncode != 0:
+            return False, (res.stderr or res.stdout or "crontab command failed").strip()
+        return True, (res.stdout or "ok").strip()
+    except Exception as exc:
+        return False, str(exc)
+
+
+def _get_crontab_raw() -> Tuple[bool, List[str], str]:
+    ok, out = _run_crontab(["-l"])
+    if not ok:
+        # no crontab for user might appear as stderr text
+        if "no crontab" in out.lower():
+            return True, [], "no crontab"
+        return False, [], out
+    return True, out.splitlines(), "ok"
+
+
+def _get_crontab_lines() -> List[str]:
+    ok, lines, _ = _get_crontab_raw()
+    if not ok:
         return ["MISSING"]
+    clean = [ln.strip() for ln in lines if ln.strip() and not ln.strip().startswith("#")]
+    keys = ("run-skill.sh", "trade", "batch", "daily", "system-status", "health", "report")
+    filtered = [ln for ln in clean if any(k in ln for k in keys)]
+    return filtered[:8] if filtered else ["MISSING"]
 
 
-def _status_from_context(last_trade: Dict[str, Any]) -> Tuple[str, str]:
+def _trade_analyst_interval_minutes(lines: List[str]) -> int:
+    for ln in lines:
+        if TRADE_ANALYST_CRON_TAG not in ln:
+            continue
+        m = re.match(r"^\s*\*/(\d+)\s+", ln)
+        if m:
+            try:
+                return max(1, int(m.group(1)))
+            except Exception:
+                pass
+    return 30
+
+
+def _status_from_context(last_trade: Dict[str, Any], cron_tail: List[str]) -> Tuple[str, str, bool]:
     risk = last_trade.get("risk_control") if isinstance(last_trade.get("risk_control"), dict) else {}
     if risk.get("circuit_breaker_active") is True:
-        return "Paused", "暫停"
+        return "Paused", "暫停", False
 
-    recent = _tail_lines(CRON_LOG, 200)
     latest_ts: Optional[datetime] = None
-    for ln in reversed(recent):
-        if ln.startswith("[") and "]" in ln:
-            t = ln[1 : ln.index("]")]
-            try:
-                latest_ts = datetime.strptime(t, "%Y-%m-%d %H:%M:%S").replace(tzinfo=datetime.now().astimezone().tzinfo)
-                break
-            except Exception:
-                continue
+    for ln in reversed(cron_tail):
+        ts = _parse_log_ts(ln)
+        if ts:
+            latest_ts = ts
+            break
+
     if latest_ts:
         delta = datetime.now().astimezone() - latest_ts
         if delta.total_seconds() <= 1800:
-            return "Running", "執行中"
+            return "Running", "執行中", False
+        if delta.total_seconds() > 7200:
+            return "Stuck", "疑似卡住", True
 
-    return "Idle", "閒置"
+    return "Idle", "閒置", False
+
+
+def _latest_report_path() -> Optional[Path]:
+    if not REPORTS_DIR.exists():
+        return None
+    files = [p for p in REPORTS_DIR.iterdir() if p.is_file()]
+    if not files:
+        return None
+    return max(files, key=lambda p: p.stat().st_mtime)
+
+
+def _collect_health(cron_tail: List[str]) -> Dict[str, Any]:
+    success_kw = ("success", "completed", "done", "report generated", "exit code 0")
+    error_kw = ("error", "failed", "traceback", "exception")
+
+    last_success = None
+    for ln in reversed(cron_tail):
+        low = ln.lower()
+        if any(k in low for k in success_kw):
+            ts = _parse_log_ts(ln)
+            if ts:
+                last_success = ts.strftime("%Y-%m-%d %H:%M:%S")
+            else:
+                last_success = ln
+            break
+
+    recent_error = None
+    for ln in reversed(cron_tail):
+        low = ln.lower()
+        if any(k in low for k in error_kw):
+            recent_error = ln
+            break
+
+    return {
+        "last_success_task_time": _fmt_missing(last_success),
+        "recent_error_summary": _fmt_missing(recent_error),
+    }
+
+
+def _compute_alerts(last_trade: Dict[str, Any], status_en: str) -> Tuple[str, str, str, List[str]]:
+    risk = last_trade.get("risk_control") if isinstance(last_trade.get("risk_control"), dict) else {}
+    tri = last_trade.get("tri_brain_status") if isinstance(last_trade.get("tri_brain_status"), dict) else {}
+
+    alerts: List[str] = []
+    level = "ok"
+
+    if risk.get("circuit_breaker_active") is True:
+        alerts.append("Circuit breaker active")
+        level = "bad"
+
+    losing_streak = risk.get("losing_streak")
+    try:
+        if losing_streak is not None and int(losing_streak) >= 3:
+            alerts.append("連虧 >= 3")
+            level = "bad"
+    except Exception:
+        pass
+
+    cooldown = risk.get("gemini_cooldown") if isinstance(risk.get("gemini_cooldown"), dict) else {}
+    if cooldown.get("active") is True:
+        alerts.append("Gemini cooldown active")
+        if level != "bad":
+            level = "warn"
+
+    gemini = tri.get("gemini") if isinstance(tri.get("gemini"), dict) else {}
+    groq = tri.get("groq") if isinstance(tri.get("groq"), dict) else {}
+    openai = tri.get("openai") if isinstance(tri.get("openai"), dict) else {}
+
+    all_fallback = all((x.get("status") in ("fallback", "failed", "unavailable") for x in (gemini, groq, openai) if isinstance(x, dict)))
+    if all_fallback and any((gemini, groq, openai)):
+        alerts.append("fallback all")
+        level = "bad"
+
+    if status_en in ("Idle", "Stuck") and level == "ok":
+        level = "warn"
+
+    if not alerts:
+        return level, "正常（Normal）", "系統運作正常（System healthy）", alerts
+
+    return level, "警示（Alert）" if level != "bad" else "危險（Danger）", "；".join(alerts), alerts
 
 
 def collect_snapshot() -> Dict[str, Any]:
     last_trade = _last_trade()
-    cron_tail = _tail_lines(CRON_LOG, 160)
+    cron_tail = _tail_lines(CRON_LOG, 200)
     scheduler = _get_crontab_lines()
 
     recent_log_events = [ln for ln in cron_tail if "[run]" in ln or "gemini_" in ln or "run_skipped" in ln]
@@ -305,7 +541,7 @@ def collect_snapshot() -> Dict[str, Any]:
     if not trade_items:
         trade_items = ["MISSING"]
 
-    en_status, zh_status = _status_from_context(last_trade)
+    en_status, zh_status, is_stuck = _status_from_context(last_trade, cron_tail)
 
     risk = last_trade.get("risk_control") if isinstance(last_trade.get("risk_control"), dict) else {}
     strategy_mode = last_trade.get("strategy_mode") if isinstance(last_trade.get("strategy_mode"), dict) else {}
@@ -315,15 +551,50 @@ def collect_snapshot() -> Dict[str, Any]:
     groq = tri.get("groq") if isinstance(tri.get("groq"), dict) else {}
     openai = tri.get("openai") if isinstance(tri.get("openai"), dict) else {}
 
+    crontab_ok, crontab_lines, _ = _get_crontab_raw()
+    interval = _trade_analyst_interval_minutes(crontab_lines if crontab_ok else [])
+
+    last_seen = None
+    for ln in reversed(cron_tail):
+        ts = _parse_log_ts(ln)
+        if ts:
+            last_seen = ts
+            break
+
+    if last_seen:
+        eta = last_seen + timedelta(minutes=interval)
+        eta_text = eta.strftime("%H:%M:%S")
+        eta_detail = f"約每 {interval} 分鐘（Every {interval} min）"
+        eta_level = "warn" if is_stuck else "ok"
+    else:
+        eta_text = "MISSING"
+        eta_detail = "無法估計（No data）"
+        eta_level = "warn"
+
+    alert_level, action_text, action_detail, alerts = _compute_alerts(last_trade, en_status)
+
+    health = _collect_health(cron_tail)
+
     return {
         "generated_at": datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S %Z"),
         "status": {"en": en_status, "zh": zh_status},
+        "hero": {
+            "current_action": {"text": action_text, "detail": action_detail, "level": alert_level},
+            "system_status": {
+                "text": f"{zh_status}（{en_status}）",
+                "detail": "系統疑似卡住（Possibly stuck）" if is_stuck else "系統更新中（System active/idle）",
+                "level": "bad" if is_stuck else ("ok" if en_status == "Running" else "warn"),
+            },
+            "next_update_eta": {"text": eta_text, "detail": eta_detail, "level": eta_level},
+        },
         "recent_tasks": {
             "cron": recent_log_events,
             "reports": report_items,
             "trades": trade_items,
         },
         "scheduler": scheduler,
+        "health_summary": health,
+        "alerts": alerts,
         "trade_snapshot": {
             "date": _fmt_missing(last_trade.get("date")),
             "active_contract": _fmt_missing(last_trade.get("active_contract")),
@@ -351,8 +622,77 @@ def collect_snapshot() -> Dict[str, Any]:
     }
 
 
+def pause_trade_analyst_cron() -> Tuple[bool, str]:
+    ok, lines, msg = _get_crontab_raw()
+    if not ok:
+        return False, f"讀取 crontab 失敗（read failed）: {msg}"
+
+    changed = False
+    out: List[str] = []
+    for ln in lines:
+        stripped = ln.lstrip()
+        if TRADE_ANALYST_CRON_TAG in stripped and not stripped.startswith("#"):
+            out.append(f"# PAUSED_BY_LIVE_MONITOR {ln}")
+            changed = True
+        else:
+            out.append(ln)
+
+    if not changed:
+        return True, "沒有可暫停的 trade-analyst 排程（no active entry found）"
+
+    ok_set, msg_set = _run_crontab(["-"], "\n".join(out) + "\n")
+    if not ok_set:
+        return False, f"寫入 crontab 失敗（write failed）: {msg_set}"
+    return True, "已暫停 trade-analyst 排程（paused）"
+
+
+def restore_trade_analyst_cron() -> Tuple[bool, str]:
+    ok, lines, msg = _get_crontab_raw()
+    if not ok:
+        return False, f"讀取 crontab 失敗（read failed）: {msg}"
+
+    out: List[str] = []
+    inserted = False
+    for ln in lines:
+        if TRADE_ANALYST_CRON_TAG in ln:
+            if not inserted:
+                out.append(TRADE_ANALYST_SAFE_CRON)
+                inserted = True
+            continue
+        out.append(ln)
+
+    if not inserted:
+        out.append(TRADE_ANALYST_SAFE_CRON)
+
+    ok_set, msg_set = _run_crontab(["-"], "\n".join(out).rstrip() + "\n")
+    if not ok_set:
+        return False, f"寫入 crontab 失敗（write failed）: {msg_set}"
+    return True, "已恢復 trade-analyst 排程（restored at */30）"
+
+
+def run_apprentice_once() -> Tuple[bool, str]:
+    try:
+        MANUAL_APPRENTICE_LOG.parent.mkdir(parents=True, exist_ok=True)
+        logf = MANUAL_APPRENTICE_LOG.open("a", encoding="utf-8")
+        subprocess.Popen(
+            ["bash", "-lc", f"cd {BASE_DIR} && ./run-skill.sh trade-apprentice"],
+            stdout=logf,
+            stderr=logf,
+        )
+        return True, f"已觸發 apprentice（triggered）; log={MANUAL_APPRENTICE_LOG}"
+    except Exception as exc:
+        return False, f"觸發失敗（trigger failed）: {exc}"
+
+
+def export_latest_report() -> Tuple[bool, str, Optional[str]]:
+    p = _latest_report_path()
+    if not p:
+        return False, "找不到 reports 檔案（no report found）", None
+    return True, "已找到最新報告（latest report found）", str(p)
+
+
 class Handler(BaseHTTPRequestHandler):
-    server_version = "LiveMonitorWeb/1.0"
+    server_version = "LiveMonitorWeb/2.0"
 
     def _send_json(self, payload: Dict[str, Any], status: int = 200) -> None:
         body = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
@@ -372,6 +712,19 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _forbid_non_localhost(self) -> bool:
+        if self.client_address[0] != "127.0.0.1":
+            self._send_json(
+                {
+                    "ok": False,
+                    "message": "拒絕：僅允許 127.0.0.1 呼叫變更操作（only localhost 127.0.0.1 allowed）",
+                    "client": self.client_address[0],
+                },
+                status=403,
+            )
+            return True
+        return False
+
     def do_GET(self) -> None:  # noqa: N802
         path = urlparse(self.path).path
         if path == "/":
@@ -384,6 +737,37 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json({"ok": True})
             return
         self._send_json({"error": "not found"}, status=404)
+
+    def do_POST(self) -> None:  # noqa: N802
+        path = urlparse(self.path).path
+
+        if path.startswith("/api/actions/") and self._forbid_non_localhost():
+            return
+
+        if path == "/api/actions/pause-trade-analyst":
+            ok, msg = pause_trade_analyst_cron()
+            self._send_json({"ok": ok, "message": msg}, status=200 if ok else 500)
+            return
+
+        if path == "/api/actions/restore-trade-analyst":
+            ok, msg = restore_trade_analyst_cron()
+            self._send_json({"ok": ok, "message": msg}, status=200 if ok else 500)
+            return
+
+        if path == "/api/actions/run-apprentice":
+            ok, msg = run_apprentice_once()
+            self._send_json({"ok": ok, "message": msg}, status=200 if ok else 500)
+            return
+
+        if path == "/api/actions/export-latest-report":
+            ok, msg, report_path = export_latest_report()
+            payload: Dict[str, Any] = {"ok": ok, "message": msg}
+            if report_path:
+                payload["path"] = report_path
+            self._send_json(payload, status=200 if ok else 404)
+            return
+
+        self._send_json({"ok": False, "error": "not found"}, status=404)
 
     def log_message(self, fmt: str, *args: Any) -> None:
         return
