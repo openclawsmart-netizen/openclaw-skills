@@ -18,6 +18,7 @@ Examples:
   ./run-skill.sh system-status
   ./run-skill.sh trade-analyst
   ./run-skill.sh ai-orchestrator
+  ./run-skill.sh report-generator
 EOF
 }
 
