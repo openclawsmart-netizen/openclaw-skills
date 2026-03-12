@@ -25,7 +25,7 @@ import subprocess
 import sys
 import time
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -631,14 +631,31 @@ def ensure_risk_tables(conn: sqlite3.Connection) -> None:
             breaker_reason TEXT,
             triggered_at TEXT,
             active_date TEXT,
+            gemini_cooldown_until TEXT,
+            gemini_cooldown_reason TEXT,
+            gemini_cooldown_set_at TEXT,
             updated_at TEXT NOT NULL
         )
         """
     )
+    # backward-compatible migration for existing DBs
+    for col, col_type in [
+        ("gemini_cooldown_until", "TEXT"),
+        ("gemini_cooldown_reason", "TEXT"),
+        ("gemini_cooldown_set_at", "TEXT"),
+    ]:
+        try:
+            conn.execute(f"ALTER TABLE risk_state ADD COLUMN {col} {col_type}")
+        except sqlite3.OperationalError:
+            pass
+
     conn.execute(
         """
-        INSERT OR IGNORE INTO risk_state (id, circuit_breaker_active, breaker_reason, triggered_at, active_date, updated_at)
-        VALUES (1, 0, '', NULL, '', ?)
+        INSERT OR IGNORE INTO risk_state (
+            id, circuit_breaker_active, breaker_reason, triggered_at, active_date,
+            gemini_cooldown_until, gemini_cooldown_reason, gemini_cooldown_set_at, updated_at
+        )
+        VALUES (1, 0, '', NULL, '', NULL, '', NULL, ?)
         """,
         (now_iso(),),
     )
@@ -740,6 +757,72 @@ def evaluate_circuit_breaker(cumulative_pnl: float, losing_streak: int) -> Optio
     if not reasons:
         return None
     return "；".join(reasons)
+
+
+def _parse_iso_utc(ts: Any) -> Optional[datetime]:
+    if not ts:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(ts))
+    except Exception:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def get_gemini_cooldown_state(conn: sqlite3.Connection) -> Dict[str, Any]:
+    row = conn.execute(
+        "SELECT gemini_cooldown_until, gemini_cooldown_reason, gemini_cooldown_set_at FROM risk_state WHERE id=1"
+    ).fetchone()
+    if not row:
+        return {"active": False, "until": None, "reason": "", "set_at": None}
+
+    until_raw, reason, set_at_raw = row
+    now_utc = datetime.now(timezone.utc)
+    until_dt = _parse_iso_utc(until_raw)
+    set_at_dt = _parse_iso_utc(set_at_raw)
+    active = bool(until_dt and now_utc < until_dt)
+    return {
+        "active": active,
+        "until": until_dt.isoformat() if until_dt else None,
+        "reason": str(reason or ""),
+        "set_at": set_at_dt.isoformat() if set_at_dt else None,
+    }
+
+
+def set_gemini_cooldown(conn: sqlite3.Connection, *, until: datetime, reason: str) -> None:
+    until_utc = until.astimezone(timezone.utc)
+    now_s = now_iso()
+    conn.execute(
+        """
+        UPDATE risk_state
+        SET gemini_cooldown_until=?, gemini_cooldown_reason=?, gemini_cooldown_set_at=?, updated_at=?
+        WHERE id=1
+        """,
+        (until_utc.isoformat(), reason[:300], now_s, now_s),
+    )
+    conn.commit()
+    append_cron_trade_log(
+        f"gemini_cooldown_triggered until={until_utc.isoformat()} reason={reason[:180]}"
+    )
+
+
+def clear_gemini_cooldown(conn: sqlite3.Connection, *, end_reason: str) -> None:
+    prev = get_gemini_cooldown_state(conn)
+    if prev.get("until"):
+        append_cron_trade_log(
+            f"gemini_cooldown_ended at={datetime.now(timezone.utc).isoformat()} previous_until={prev.get('until')} reason={end_reason[:180]}"
+        )
+    conn.execute(
+        """
+        UPDATE risk_state
+        SET gemini_cooldown_until=NULL, gemini_cooldown_reason='', gemini_cooldown_set_at=NULL, updated_at=?
+        WHERE id=1
+        """,
+        (now_iso(),),
+    )
+    conn.commit()
 
 
 def _contains_any(text: str, keywords: List[str]) -> bool:
@@ -1173,6 +1256,7 @@ def step2_gemini_strategy(
     monthly: MonthlyProgress,
     mode_ctx: StrategyModeContext,
     force_goal_optimization: bool,
+    gemini_cooldown_state: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     key = (os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY") or "").strip()
     requests = _get_requests_module()
@@ -1180,7 +1264,7 @@ def step2_gemini_strategy(
     risk_level = int(groq_norm.get("risk_level", 5))
     vol_flag = str(groq_norm.get("volatility_flag", "normal"))
 
-    def fallback(reason: str) -> Dict[str, Any]:
+    def fallback(reason: str, degrade_cause: Optional[str] = None) -> Dict[str, Any]:
         score = 50
         if s.close > s.ema20 > s.ema50:
             score += 15
@@ -1236,7 +1320,32 @@ def step2_gemini_strategy(
             "optimization_suggestion": optimization_text,
             "new_skill_proposal": proposal,
         }
-        return {"status": "fallback", "reason": reason, "raw_json": payload}
+        return {
+            "status": "fallback",
+            "reason": reason,
+            "raw_json": payload,
+            "degraded": bool(degrade_cause),
+            "degrade_cause": degrade_cause or "",
+            "trigger_cooldown": False,
+            "cooldown_seconds": 0,
+        }
+
+    cooldown_state = gemini_cooldown_state or {}
+    if bool(cooldown_state.get("active")):
+        until = str(cooldown_state.get("until") or "")
+        reason = str(cooldown_state.get("reason") or "gemini_429_cooldown")
+        append_cron_trade_log(
+            f"gemini_skip_during_cooldown until={until} reason={reason}"
+        )
+        return fallback(f"Gemini cooldown active until {until}", degrade_cause="gemini_cooldown")
+
+    if (os.getenv("TRADE_ANALYST_SIMULATE_GEMINI_429") or "").strip() == "1":
+        append_cron_trade_log("gemini_error status=429 error_type=simulated attempt=0/0 message=TRADE_ANALYST_SIMULATE_GEMINI_429")
+        cooldown_seconds = int((os.getenv("TRADE_ANALYST_GEMINI_COOLDOWN_SECONDS") or "900").strip() or 900)
+        return fallback("Gemini HTTP 429 (simulated)", degrade_cause="gemini_429") | {
+            "trigger_cooldown": True,
+            "cooldown_seconds": max(60, cooldown_seconds),
+        }
 
     if not key or requests is None:
         reason = "missing GEMINI_API_KEY/GOOGLE_API_KEY" if not key else "missing requests dependency"
@@ -1319,6 +1428,13 @@ def step2_gemini_strategy(
                 sleep_s = base_backoff_seconds * (2 ** (attempt - 1)) + random.uniform(0.0, 0.6)
                 time.sleep(sleep_s)
                 continue
+
+            if status == 429:
+                cooldown_seconds = int((os.getenv("TRADE_ANALYST_GEMINI_COOLDOWN_SECONDS") or "900").strip() or 900)
+                return fallback(last_error_reason, degrade_cause="gemini_429") | {
+                    "trigger_cooldown": True,
+                    "cooldown_seconds": max(60, cooldown_seconds),
+                }
 
             return fallback(last_error_reason)
         except Exception as exc:
@@ -1508,6 +1624,7 @@ def telegram_summary(
     active_contract: str,
     rollover_status: str,
     consultant_tags: Optional[List[str]] = None,
+    quota_degraded: bool = False,
 ) -> str:
     msg = (
         "📊 道瓊期貨 AI 交易員 (15m)\n"
@@ -1517,6 +1634,8 @@ def telegram_summary(
         f"🧾 Active Contract：{active_contract} ({rollover_status})\n"
         f"🤖 最新計畫：{p.action} (Entry: {p.entry:.2f}, SL: {p.sl:.2f}, TP: {p.tp:.2f})"
     )
+    if quota_degraded:
+        msg += "\n⚠️ 本次因配額降級：Gemini 不可用，已自動改走 Groq + 規則引擎。"
     if p.new_skill_proposal:
         msg += (
             "\n🧪 [研發提案]\n"
@@ -1672,10 +1791,19 @@ def main() -> int:
 
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     perf_anomaly: Dict[str, Any] = {"abnormal": False, "reason": "not_evaluated"}
+    quota_degraded = False
+    gemini_degrade_cause = ""
+    gemini_cooldown_state: Dict[str, Any] = {"active": False, "until": None, "reason": "", "set_at": None}
     conn = sqlite3.connect(DB_PATH)
     try:
         ensure_db(conn)
         ensure_risk_tables(conn)
+
+        # Gemini cooldown lifecycle (persistent in SQLite risk_state)
+        gemini_cooldown_state = get_gemini_cooldown_state(conn)
+        if (not gemini_cooldown_state.get("active")) and gemini_cooldown_state.get("until"):
+            clear_gemini_cooldown(conn, end_reason="expired")
+            gemini_cooldown_state = get_gemini_cooldown_state(conn)
 
         today_tpe = now_tpe.strftime("%Y-%m-%d")
         cb_state = get_circuit_breaker_state(conn)
@@ -1728,7 +1856,22 @@ def main() -> int:
             monthly_progress,
             mode_ctx,
             force_goal_optimization,
+            gemini_cooldown_state=gemini_cooldown_state,
         )
+
+        if bool(gemini_result.get("trigger_cooldown")):
+            cooldown_seconds = int(gemini_result.get("cooldown_seconds") or 900)
+            cooldown_until = datetime.now(timezone.utc) + timedelta(seconds=max(60, cooldown_seconds))
+            set_gemini_cooldown(
+                conn,
+                until=cooldown_until,
+                reason=str(gemini_result.get("reason") or "gemini_429"),
+            )
+            gemini_cooldown_state = get_gemini_cooldown_state(conn)
+
+        quota_degraded = bool(gemini_result.get("degraded"))
+        gemini_degrade_cause = str(gemini_result.get("degrade_cause") or "")
+
         plan, openai_result = step3_openai_arbitrate(s, groq_result.get("normalized", {}), gemini_result.get("raw_json", {}))
 
         prior_trade_status = get_prior_trade_status(conn, s.close)
@@ -1758,7 +1901,13 @@ def main() -> int:
 
     tri_brain_status = {
         "groq": {"status": groq_result.get("status"), "reason": groq_result.get("reason"), "normalized": groq_result.get("normalized")},
-        "gemini": {"status": gemini_result.get("status"), "reason": gemini_result.get("reason")},
+        "gemini": {
+            "status": gemini_result.get("status"),
+            "reason": gemini_result.get("reason"),
+            "degraded": quota_degraded,
+            "degrade_cause": gemini_degrade_cause,
+            "cooldown": gemini_cooldown_state,
+        },
         "openai": {"status": openai_result.get("status"), "reason": openai_result.get("reason")},
     }
     risk_control = {
@@ -1768,6 +1917,8 @@ def main() -> int:
         "circuit_breaker_reason": cb_state.get("reason"),
         "circuit_breaker_active_date": cb_state.get("active_date"),
         "manual_reset_done": manual_reset_done,
+        "gemini_cooldown": gemini_cooldown_state,
+        "quota_degraded": quota_degraded,
     }
 
     consultant_tags, consultant_notes = build_consultant_routing(
@@ -1791,6 +1942,7 @@ def main() -> int:
             active_contract=rollover_decision.active_contract,
             rollover_status=rollover_status,
             consultant_tags=consultant_tags,
+            quota_degraded=quota_degraded,
         )
     )
 
@@ -1859,6 +2011,7 @@ def main() -> int:
         f"mode={mode_ctx.mode} recent_winrate={safe_float(recent_stats.get('winrate'), 0.0):.1f}%"
     )
     print(f"[info] Groq risk: {json.dumps(groq_result.get('normalized', {}), ensure_ascii=False)}")
+    print(f"[info] Gemini degrade: {quota_degraded} cause={gemini_degrade_cause} cooldown={json.dumps(gemini_cooldown_state, ensure_ascii=False)}")
     print(f"[info] Plan: sentiment_score={plan.sentiment_score} action={plan.action} entry={plan.entry:.2f} sl={plan.sl:.2f} tp={plan.tp:.2f}")
     print(f"[info] new_skill_proposal={json.dumps(plan.new_skill_proposal, ensure_ascii=False)}")
     print(f"[info] Risk: daily_pnl={daily_pnl:.2f} losing_streak={losing_streak} circuit_breaker_active={cb_state.get('active')} reason={cb_state.get('reason')}")
